@@ -1,0 +1,715 @@
+<task id="{bmad_folder}/custom/orchestrator/tasks/ralph-iterate.xml"
+      name="Ralph Single Iteration">
+  <objective>Execute a single iteration of the Ralph 5-phase micro-pipeline</objective>
+
+  <llm critical="true">
+    <mandate>Execute ONE task through the 5-phase pipeline: PLAN → TEST → IMPLEMENT → REVIEW → FIX</mandate>
+    <mandate>Spawn fresh subagent for each phase with NO conversation history carried over</mandate>
+    <mandate>All state flows through disk files (PLAN.md, scratchpad.md, etc.)</mandate>
+    <mandate>Run backpressure gates (tests) after implementation phase</mandate>
+    <mandate>Handle failures with checkpoint rollback when configured (worktree primary, stash fallback)</mandate>
+    <mandate>Track token usage and cost for each phase</mandate>
+  </llm>
+
+  <inputs>
+    <input name="session_id" required="true" desc="Ralph session identifier"/>
+    <input name="iteration" required="true" desc="Current iteration number (1-indexed)"/>
+    <input name="task" required="true" desc="Task description to implement"/>
+    <input name="task_index" required="true" desc="Index of task in PLAN.md (for marking done)"/>
+    <input name="state_dir" required="true" desc="Path to _bmad/ralph/ state directory"/>
+    <input name="phases" required="true" desc="Phase configuration (enabled, backend, preset for each)"/>
+    <input name="approve_mode" default="false" desc="If true, pause for human approval at gates"/>
+    <input name="auto_commit" default="true" desc="If true, create git commits for iteration completion"/>
+    <input name="skip_empty_commits" default="true" desc="If true, skip iteration commits when nothing is staged"/>
+    <input name="story_id" required="false" desc="Story ID if BMAD mode"/>
+    <input name="story_path" required="false" desc="Path to story .md file"/>
+    <input name="story_context_path" required="false" desc="Path to story .context.xml file"/>
+    <input name="goal_spec_path" required="false" default="_bmad/_config/custom/orchestrator/workflows/run/goal-specs/ralph-iterate.json" desc="Path to goal_spec JSON describing completion criteria. Rendered into phase prompts and used to emit verdict + goal_text in orch:session_complete telemetry. See docs/goal-spec.md."/>
+  </inputs>
+
+  <flow>
+    <!-- ================================================================== -->
+    <!-- STEP 0: Goal Spec Render (Cross-CLI Completion Contract)           -->
+    <!-- ================================================================== -->
+    <step n="0" title="Render Goal Spec">
+      <action>If goal_spec_path is set and the file exists:
+        ```bash
+        # Render universal prompt block (appended to all phase prompts below)
+        scripts/render-goal-spec.sh --spec "{goal_spec_path}" --target prompt \
+          > "{state_dir}/iterations/{iteration:03d}-goal-prompt.md"
+
+        # Capture goal_text for telemetry
+        GOAL_TEXT=$(python3 -c "import json; print(json.load(open('{goal_spec_path}'))['goal_spec']['outcome'])")
+        ```
+      </action>
+      <action>Store GOAL_TEXT and goal-prompt path in session.json for step 8/9 telemetry</action>
+      <action>If goal_spec_path not set: skip (backward-compatible — workflows without a spec keep current behavior)</action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 1: Initialize Iteration                                       -->
+    <!-- ================================================================== -->
+    <step n="1" title="Initialize Iteration">
+      <action>Read session.json from {state_dir} to get current state</action>
+      <action>Read GUARDRAILS.md from {state_dir} for project rules</action>
+      <action>Read scratchpad.md from {state_dir} for cross-iteration context</action>
+      <action>Read handoff.md from {state_dir} if it exists (carries context from previous phase)</action>
+      <action>If handoff.md exists, set handoff_content template variable with its content</action>
+      <action>Create iteration log file: {state_dir}/iterations/{iteration:03d}.log</action>
+      <action>Update session.json: current_iteration = {iteration}</action>
+      <action>Log: "=== Iteration {iteration}: {task} ==="</action>
+      <action>If goal prompt block exists (from step 0), append its contents to every phase prompt assembled in steps 3-7 (PLAN/TEST/IMPLEMENT/REVIEW/FIX). The goal block is the LAST section of each prompt so it survives any truncation.</action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 2: Create Task Checkpoint                                     -->
+    <!-- ================================================================== -->
+    <step n="2" title="Create Task Checkpoint">
+      <!--
+        ISOLATION MODEL:
+        Phase execution uses Claude Agent tool's `isolation: "worktree"` parameter (or Codex/Gemini
+        manual worktree creation per instructions.md). The checkpoint here is a ROLLBACK SNAPSHOT,
+        not the execution environment. Subagents run in their own disposable worktrees managed by
+        the Agent tool — this checkpoint preserves the main worktree state for recovery.
+      -->
+      <check if="phases.safety.checkpoint_before_task = true">
+        <!-- Primary: snapshot via worktree (lightweight, instant, no working tree conflicts) -->
+        <action>Try worktree snapshot:
+          - Execute: git worktree add --detach .claude/worktrees/ralph-checkpoint-{iteration} HEAD
+          - If successful: store worktree path in session.json, set checkpoint_mode = "worktree"
+          - Log: "Worktree snapshot created: ralph-checkpoint-{iteration}"
+        </action>
+        <!-- Fallback: stash snapshot when worktree creation fails -->
+        <check if="worktree creation failed">
+          <action>Log warning: "Worktree unavailable, falling back to stash snapshot"</action>
+          <action>Execute: git stash push --include-untracked -m "ralph-checkpoint-{iteration}"</action>
+          <action>Store stash name in session.json, set checkpoint_mode = "stash"</action>
+          <action>Execute: git stash pop (restore working tree — stash is kept as named ref)</action>
+          <action>Log: "Stash snapshot created: ralph-checkpoint-{iteration}"</action>
+        </check>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 3: Phase 0 - PLAN (if enabled)                               -->
+    <!-- ================================================================== -->
+    <step n="3" title="Phase 0: PLAN">
+      <check if="phases.plan.enabled = true">
+        <action>Log: "--- Phase: PLAN ---"</action>
+        <action>Resolve constraints for phase=plan:
+          - global_cannot_do = constraints.global.cannot_do
+          - phase_cannot_do = constraints.phases.plan.cannot_do
+          - phase_must_do = merge(constraints.global.must_do, constraints.phases.plan.must_do)
+        </action>
+        <action>Build prompt from iteration-prompt.md template with phase=plan</action>
+        <action>Inject status block instruction via inject_status_instruction(prompt)</action>
+        <action>Include: task description, scratchpad.md content, story context (if BMAD mode)</action>
+
+        <action>Spawn subagent:
+          - Backend: {phases.plan.backend}
+          - Preset: {phases.plan.preset}
+          - Prompt: [rendered plan prompt]
+          - Log to: {state_dir}/iterations/{iteration:03d}-plan.log
+        </action>
+
+        <action>Capture approach from subagent output</action>
+        <action>Append approach to scratchpad.md:
+          ```
+          ## Iteration {iteration} - Plan
+          {approach}
+          ```
+        </action>
+
+        <action>Track cost: record input/output tokens for plan phase</action>
+
+        <action>Write handoff.md to {state_dir} using handoff.md.tpl template:
+          - from_phase: plan
+          - to_phase: test (or implement if test disabled)
+          - Include: approach decisions, edge cases found, files identified
+        </action>
+
+        <check if="approve_mode = true">
+          <action>Display approach to user</action>
+          <action>HALT and wait for user approval</action>
+          <action>If rejected: mark task as skipped, return early</action>
+        </check>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 4: Phase 1 - TEST (if ATDD enabled)                          -->
+    <!-- ================================================================== -->
+    <step n="4" title="Phase 1: TEST (ATDD)">
+      <check if="phases.test.enabled = true">
+        <action>Log: "--- Phase: TEST (ATDD - RED) ---"</action>
+        <action>Resolve constraints for phase=test:
+          - global_cannot_do = constraints.global.cannot_do
+          - phase_cannot_do = constraints.phases.test.cannot_do
+          - phase_must_do = merge(constraints.global.must_do, constraints.phases.test.must_do)
+        </action>
+        <!-- TEA Mode: select enriched template -->
+        <check if="phases.test.tea_mode = true">
+          <action>Build prompt from tea-test-prompt.md template with phase=test</action>
+          <action>Resolve TEA knowledge context:
+            - Detect stack type (scan for package.json → frontend, pyproject.toml → backend, both → fullstack)
+            - Load condensed knowledge: try {phases.test.tea_knowledge_path} first, then orchestrator/data/tea-knowledge-condensed.md
+            - If neither file exists: log warning "TEA knowledge file not found, proceeding without knowledge injection" and set {{tea_knowledge_context}} to empty
+            - Otherwise inject full condensed knowledge into {{tea_knowledge_context}} (file is compact at ~170 lines)
+          </action>
+        </check>
+        <check if="phases.test.tea_mode != true">
+          <action>Build prompt from iteration-prompt.md template with phase=test</action>
+        </check>
+        <action>Include: task description, approach from plan phase</action>
+
+        <action>Spawn subagent:
+          - Backend: {phases.test.backend}
+          - Preset: {phases.test.preset}
+          - Prompt: [rendered test prompt]
+          - Log to: {state_dir}/iterations/{iteration:03d}-test.log
+        </action>
+
+        <action>Identify new test file created</action>
+        <action>Record test_file path for implement phase</action>
+        <action>Track cost: record input/output tokens for test phase</action>
+
+        <action>Write handoff.md to {state_dir} using handoff.md.tpl template:
+          - from_phase: test
+          - to_phase: implement
+          - Include: test file path, test strategy, expected failure behavior
+        </action>
+
+        <!-- Run tests - should FAIL (RED) -->
+        <action>Run tests to verify failure state:
+          - Execute: {gates.tests.command}
+          - Capture output to: {state_dir}/evidence/test-red-{iteration}.txt
+        </action>
+
+        <check if="tests passed unexpectedly">
+          <action>Log warning: "Tests passed before implementation - test may be incomplete"</action>
+          <action>Continue anyway (test might be verifying existing behavior)</action>
+        </check>
+
+        <!-- TEA Quality Gate: score test quality if enabled -->
+        <check if="phases.test.tea_mode = true AND gates.test_quality.enabled = true">
+          <action>Log: "Running TEA quality gate on test files"</action>
+          <action>Spawn quality gate subagent:
+            - Backend: {phases.test.backend}
+            - Prompt: tea-quality-gate.md with {{test_files}}, {{quality_threshold}}, {{task_description}}, {{story_acceptance_criteria}}
+            - Log to: {state_dir}/evidence/tea-quality-{iteration}.json
+          </action>
+          <action>Parse quality score from JSON output:
+            - If valid JSON with quality_score field: use the score
+            - If invalid JSON or missing quality_score: log warning "TEA quality gate returned invalid output, treating as advisory skip" and set quality_score = -1 (skip threshold check)
+          </action>
+          <action>Track cost: record input/output tokens for quality gate evaluation</action>
+          <check if="quality_score &gt;= 0 AND quality_score &lt; gates.test_quality.threshold">
+            <action>Log warning: "TEA quality score {quality_score} below threshold {gates.test_quality.threshold}"</action>
+            <action>Append quality recommendations to scratchpad.md</action>
+            <!-- Quality gate is advisory (required: false), so continue -->
+          </check>
+          <check if="quality_score &gt;= gates.test_quality.threshold">
+            <action>Log: "TEA quality gate passed: {quality_score}/{gates.test_quality.threshold}"</action>
+          </check>
+        </check>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 5: Phase 2 - IMPLEMENT                                       -->
+    <!-- ================================================================== -->
+    <step n="5" title="Phase 2: IMPLEMENT">
+      <action>Log: "--- Phase: IMPLEMENT ---"</action>
+      <action>Resolve constraints for phase=implement:
+        - global_cannot_do = constraints.global.cannot_do
+        - phase_cannot_do = constraints.phases.implement.cannot_do
+        - phase_must_do = merge(constraints.global.must_do, constraints.phases.implement.must_do)
+      </action>
+      <action>Build prompt from iteration-prompt.md template with phase=implement</action>
+      <action>Inject status block instruction via inject_status_instruction(prompt)</action>
+      <action>Include: task description, approach, test_file path (if ATDD)</action>
+
+      <action>Spawn subagent:
+        - Backend: {phases.implement.backend}
+        - Preset: {phases.implement.preset}
+        - Prompt: [rendered implement prompt]
+        - Log to: {state_dir}/iterations/{iteration:03d}-implement.log
+      </action>
+
+      <action>Track cost: record input/output tokens for implement phase</action>
+
+      <action>Write handoff.md to {state_dir} using handoff.md.tpl template:
+        - from_phase: implement
+        - to_phase: review
+        - Include: files changed, implementation decisions, known limitations
+      </action>
+
+      <!-- Run backpressure gates -->
+      <action>Run tests to verify implementation:
+        - Execute: {gates.tests.command}
+        - Capture output to: {state_dir}/evidence/test-green-{iteration}.txt
+      </action>
+
+      <check if="tests failed">
+        <!-- Silent retry for flake detection -->
+        <action>Re-run tests once (silent retry for flake detection)</action>
+        <check if="tests still failed AND phases.implement.tea_healing = true">
+          <action>Log: "Tests failed after implementation - attempting TEA self-healing"</action>
+          <action>Capture test failure output for healing prompt</action>
+          <action>Spawn healing subagent:
+            - Backend: {phases.implement.backend}
+            - Preset: {phases.implement.preset}
+            - Prompt: tea-healing-prompt.md with {{test_failure_output}}
+            - Log to: {state_dir}/iterations/{iteration:03d}-impl-heal.log
+          </action>
+          <action>Re-run tests after healing</action>
+          <check if="tests passed">
+            <action>Log: "TEA self-healing succeeded after implementation"</action>
+          </check>
+        </check>
+
+        <check if="tests failed">
+          <action>Increment retry_count</action>
+          <check if="retry_count > max_retries_per_task">
+            <action>Log: "Implementation failed after {retry_count} retries"</action>
+            <check if="phases.safety.rollback_on_failure = true">
+              <check if="isolation_mode = 'worktree'">
+                <action>Execute: git checkout -- . (discard worktree changes, worktree is disposable)</action>
+              </check>
+              <check if="isolation_mode = 'stash'">
+                <action>Execute: git stash apply ralph-checkpoint-{iteration}</action>
+              </check>
+            </check>
+            <action>Mark task as BLOCKED in PLAN.md</action>
+            <action>Return with status=blocked</action>
+          </check>
+          <action>Log: "Tests failed, retrying implementation (attempt {retry_count})"</action>
+          <action>GOTO step 5 (retry implement phase)</action>
+        </check>
+      </check>
+
+      <action>Log: "Implementation passed tests"</action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 6: Phase 3 - REVIEW (if enabled)                             -->
+    <!-- ================================================================== -->
+    <step n="6" title="Phase 3: REVIEW">
+      <check if="phases.review.enabled = true">
+        <action>Log: "--- Phase: REVIEW ---"</action>
+        <action>Resolve constraints for phase=review:
+          - global_cannot_do = constraints.global.cannot_do
+          - phase_cannot_do = constraints.phases.review.cannot_do
+          - phase_must_do = merge(constraints.global.must_do, constraints.phases.review.must_do)
+        </action>
+
+        <!-- Get diff since checkpoint -->
+        <action>Execute: git diff HEAD to get changes</action>
+        <action>Store diff for review prompt</action>
+
+        <action>Build prompt from iteration-prompt.md template with phase=review</action>
+        <action>Inject status block instruction via inject_status_instruction(prompt)</action>
+        <action>Include: task description, git diff</action>
+
+        <action>Spawn subagent:
+          - Backend: {phases.review.backend}
+          - Preset: {phases.review.preset}
+          - Prompt: [rendered review prompt]
+          - Log to: {state_dir}/iterations/{iteration:03d}-review.log
+        </action>
+
+        <action>Parse review output for:
+          - has_issues: boolean
+          - issues: array of {severity, category, file, line, description, suggestion}
+          - summary: string
+        </action>
+
+        <action>Track cost: record input/output tokens for review phase</action>
+
+        <action>Write handoff.md to {state_dir} using handoff.md.tpl template:
+          - from_phase: review
+          - to_phase: fix (or commit if no issues)
+          - Include: issues found, severity assessment, fix guidance
+        </action>
+
+        <check if="approve_mode = true AND has_issues = false">
+          <action>Display review summary to user</action>
+          <action>HALT and wait for user approval to commit</action>
+          <action>If rejected: return for manual review</action>
+        </check>
+
+        <check if="has_issues = true">
+          <action>Proceed to FIX phase (step 7)</action>
+        </check>
+        <check if="has_issues = false">
+          <action>Skip FIX phase, proceed to commit (step 8)</action>
+        </check>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 7: Phase 4 - FIX (if review found issues)                    -->
+    <!-- ================================================================== -->
+    <step n="7" title="Phase 4: FIX">
+      <check if="has_issues = true AND phases.fix.enabled = true">
+        <action>Initialize fix_attempts = 0</action>
+
+        <loop while="has_issues = true AND fix_attempts &lt; max_fix_attempts">
+          <action>Increment fix_attempts</action>
+          <action>Log: "--- Phase: FIX (attempt {fix_attempts}) ---"</action>
+          <action>Resolve constraints for phase=fix:
+            - global_cannot_do = constraints.global.cannot_do
+            - phase_cannot_do = constraints.phases.fix.cannot_do
+            - phase_must_do = merge(constraints.global.must_do, constraints.phases.fix.must_do)
+          </action>
+
+          <action>Build prompt from iteration-prompt.md template with phase=fix</action>
+          <action>Inject status block instruction via inject_status_instruction(prompt)</action>
+          <action>Include: issues array from review</action>
+
+          <action>Spawn subagent:
+            - Backend: {phases.fix.backend}
+            - Preset: {phases.fix.preset}
+            - Prompt: [rendered fix prompt]
+            - Log to: {state_dir}/iterations/{iteration:03d}-fix-{fix_attempts}.log
+          </action>
+
+          <action>Track cost: record input/output tokens for fix phase</action>
+
+          <action>Write handoff.md to {state_dir} using handoff.md.tpl template:
+            - from_phase: fix
+            - to_phase: review (re-review)
+            - Include: fixes applied, remaining concerns, test results
+          </action>
+
+          <!-- Verify fix didn't break tests -->
+          <action>Run tests:
+            - Execute: {gates.tests.command}
+            - Capture output to: {state_dir}/evidence/test-fix-{iteration}-{fix_attempts}.txt
+          </action>
+
+          <check if="tests failed">
+            <!-- Silent retry first (flake detection) -->
+            <action>Log: "Tests failed after fix - silent retry for flake detection"</action>
+            <action>Re-run tests once:
+              - Execute: {gates.tests.command}
+              - Capture output to: {state_dir}/evidence/test-fix-retry-{iteration}-{fix_attempts}.txt
+            </action>
+
+            <check if="tests still failed AND phases.fix.tea_healing = true">
+              <!-- TEA Self-Healing: attempt targeted test repair before rollback -->
+              <action>Log: "Tests failed after retry - attempting TEA self-healing"</action>
+              <action>Capture test failure output for healing prompt</action>
+              <action>Spawn healing subagent:
+                - Backend: {phases.fix.backend}
+                - Preset: {phases.fix.preset}
+                - Prompt: tea-healing-prompt.md with {{test_failure_output}}
+                - Log to: {state_dir}/iterations/{iteration:03d}-heal-{fix_attempts}.log
+              </action>
+              <action>Re-run tests after healing:
+                - Execute: {gates.tests.command}
+                - Capture output to: {state_dir}/evidence/test-heal-{iteration}-{fix_attempts}.txt
+              </action>
+              <check if="tests passed">
+                <action>Log: "TEA self-healing succeeded"</action>
+              </check>
+              <check if="tests still failed">
+                <action>Log: "TEA self-healing failed - proceeding to rollback"</action>
+              </check>
+            </check>
+
+            <check if="tests still failed">
+              <action>Log: "Fix broke tests, rolling back to checkpoint"</action>
+              <check if="phases.safety.rollback_on_failure = true">
+                <check if="checkpoint_mode = 'worktree'">
+                  <!-- Reset main worktree to snapshot state -->
+                  <action>Execute: git checkout .claude/worktrees/ralph-checkpoint-{iteration} -- .</action>
+                  <action>Log: "Rolled back to worktree snapshot"</action>
+                </check>
+                <check if="checkpoint_mode = 'stash'">
+                  <!-- Reset to stashed state -->
+                  <action>Execute: git checkout -- .</action>
+                  <action>Execute: git stash apply "stash@{/ralph-checkpoint-{iteration}}"</action>
+                  <action>Log: "Rolled back to stash snapshot"</action>
+                </check>
+              </check>
+              <action>Mark task as BLOCKED in PLAN.md</action>
+              <action>Return with status=blocked, reason="Fix broke tests"</action>
+            </check>
+          </check>
+
+          <!-- Re-review to check if issues resolved -->
+          <action>Re-run review phase (abbreviated):
+            - Get new diff
+            - Spawn review subagent
+            - Parse for has_issues
+          </action>
+
+          <check if="has_issues = false">
+            <action>Log: "All issues resolved"</action>
+            <action>Exit fix loop</action>
+          </check>
+        </loop>
+
+        <check if="fix_attempts >= max_fix_attempts AND has_issues = true">
+          <action>Log: "Could not resolve all issues after {fix_attempts} attempts"</action>
+          <action>Mark task as NEEDS_MANUAL in PLAN.md</action>
+          <action>Append unresolved issues to scratchpad.md</action>
+          <!-- Still commit with issues logged, don't block entirely -->
+        </check>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 8: Commit and Mark Done                                       -->
+    <!-- ================================================================== -->
+    <step n="8" title="Commit and Mark Done">
+      <action>Log: "--- Finalizing Task ---"</action>
+
+      <!-- Mark task as done in PLAN.md -->
+      <action>Read PLAN.md</action>
+      <action>Replace "- [ ] {task}" with "- [x] {task} *(Iteration {iteration})*"</action>
+      <action>Write updated PLAN.md</action>
+
+      <!-- Update PROGRESS.md -->
+      <action>Append to PROGRESS.md:
+        ```
+        ### Iteration {iteration}: {task}
+        - Commit: auto if enabled (see git log)
+        - Phases: {phases_executed}
+        - Cost: ${iteration_cost}
+        - Time: {execution_time}
+        ```
+      </action>
+
+      <!-- Update cost tracker -->
+      <action>Update cost-tracker.json with this iteration's usage</action>
+
+      <check if="auto_commit = true">
+        <action>Log: "--- Committing ---"</action>
+        <action>Execute: git add -A</action>
+        
+        <check if="skip_empty_commits = true">
+          <action>Check staged diff with: git diff --cached --quiet</action>
+
+          <check if="staged diff is not empty">
+            <action>Create commit message:
+              ```
+              {task}
+
+              Ralph iteration {iteration}
+              Session: {session_id}
+
+              Co-Authored-By: Ralph Mode &lt;noreply@anthropic.com&gt;
+              ```
+            </action>
+            <action>Execute: git commit -m "{commit_message}"</action>
+            <action>Capture commit hash</action>
+            <action>Log: "Task completed: {commit_hash}"</action>
+          </check>
+
+          <check if="staged diff is empty">
+            <action>Set commit_hash = ""</action>
+            <action>Log: "Task completed with no commit (nothing staged)"</action>
+          </check>
+        </check>
+
+        <check if="skip_empty_commits != true">
+          <action>Create commit message:
+            ```
+            {task}
+
+            Ralph iteration {iteration}
+            Session: {session_id}
+
+            Co-Authored-By: Ralph Mode &lt;noreply@anthropic.com&gt;
+            ```
+          </action>
+          <action>Execute: git commit -m "{commit_message}"</action>
+          <action>Capture commit hash</action>
+          <action>Log: "Task completed: {commit_hash}"</action>
+        </check>
+      </check>
+
+      <check if="auto_commit != true">
+        <action>Set commit_hash = ""</action>
+        <action>Log: "Task completed without git commit (auto_commit disabled)"</action>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 8b: Circuit Breaker Check                                     -->
+    <!-- ================================================================== -->
+    <step n="8b" title="Circuit Breaker Check">
+      <action>Check circuit breaker state using CircuitBreaker.check() with iteration result:
+        - iteration: {iteration}
+        - files_modified: count of files changed this iteration
+        - test_output: last test output (for error hash)
+        - output_tokens: tokens used this iteration
+        - cost_usd: cost of this iteration from cost tracker
+        - test_only: whether only test files were modified
+      </action>
+
+      <check if="circuit_breaker.state = OPEN">
+        <action>Log: "CIRCUIT BREAKER TRIPPED: {circuit_breaker.trip_reason}"</action>
+        <action>Write trip reason to session.json: circuit_breaker_trip = {circuit_breaker.trip_reason}</action>
+        <action>Update session.json status to "halted"</action>
+        <action>Return with status=halted, reason=circuit_breaker.trip_reason</action>
+      </check>
+
+      <check if="circuit_breaker.state = HALF_OPEN">
+        <action>Log: "Circuit breaker HALF_OPEN: probe iteration allowed with reduced scope"</action>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 8c: Parse Status Block                                        -->
+    <!-- ================================================================== -->
+    <step n="8c" title="Parse Status Block">
+      <action>Parse status block from last phase output using parse_status_block()</action>
+
+      <check if="status_block found">
+        <action>Log: "Status block: {status_block.status}, files={status_block.files_modified}, tests={status_block.tests_status}"</action>
+        <action>Feed status block data into circuit breaker (files_modified, tests_status)</action>
+        <check if="status_block.exit_signal = true">
+          <action>Log: "Exit signal received: {status_block.recommendation}"</action>
+          <action>Write exit signal to session.json</action>
+        </check>
+      </check>
+
+      <check if="status_block not found">
+        <action>Log warning: "No status block in agent output — falling back to schema parsing"</action>
+        <!-- Continue normally — status block is enhancement, not requirement -->
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 9: Cleanup + Goal Verdict Telemetry                           -->
+    <!-- ================================================================== -->
+    <step n="9" title="Cleanup">
+      <check if="checkpoint_mode = 'worktree'">
+        <action>Remove worktree snapshot (no longer needed): git worktree remove .claude/worktrees/ralph-checkpoint-{iteration} --force</action>
+      </check>
+      <check if="checkpoint_mode = 'stash'">
+        <action>Drop checkpoint stash (no longer needed): git stash drop "stash@{/ralph-checkpoint-{iteration}}"</action>
+      </check>
+      <action>Update session.json with iteration results</action>
+
+      <!-- Emit verdict + goal_text into events.ndjson (consumed by orch:session_complete) -->
+      <action>Compute VERDICT from iteration status:
+        ```
+        status=completed AND all gates passed AND has_issues=false → VERDICT=PASS
+        status=blocked OR status=needs_manual                      → VERDICT=BLOCKED
+        anything else                                              → VERDICT=FAIL
+        ```
+      </action>
+      <action>Append to {state_dir}/events.ndjson:
+        ```json
+        {"event":"orch:iteration_complete","session_id":"{session_id}","iteration":{iteration},"verdict":"{VERDICT}","goal_text":"{GOAL_TEXT}","ts":"<iso8601>"}
+        ```
+      </action>
+
+      <!-- Seed reusable pattern on PASS -->
+      <check if="VERDICT = PASS AND goal_spec_path is set">
+        <action>Call your memory-store MCP tool (if available) with:
+          - scope: "project"
+          - entry_type: "reusable_pattern"
+          - payload: {"name":"ralph-iterate:{task}", "goal_spec":&lt;contents of goal_spec_path&gt;, "iterations_used":1, "session_id":"{session_id}"}
+        </action>
+        <action>If MCP unavailable, append the same record to {state_dir}/patterns.ndjson for batch ingestion later</action>
+      </check>
+
+      <action>Check for completion signal in PLAN.md</action>
+      <check if="all tasks marked done">
+        <action>Write completion signal: &lt;!-- RALPH_COMPLETE: true --&gt;</action>
+      </check>
+    </step>
+  </flow>
+
+  <outputs>
+    <output name="success" type="boolean" desc="True if task completed and committed"/>
+    <output name="status" type="string" values="completed|blocked|needs_manual|timeout|error" desc="Iteration result"/>
+    <output name="commit_hash" type="string" desc="Git commit hash if successful"/>
+    <output name="phases_executed" type="array" desc="List of phases that ran"/>
+    <output name="tokens_used" type="number" desc="Cost of this iteration in USD"/>
+    <output name="input_tokens" type="number" desc="Total input tokens across all phases"/>
+    <output name="output_tokens" type="number" desc="Total output tokens across all phases"/>
+    <output name="retry_count" type="number" desc="How many retries were needed"/>
+    <output name="fix_attempts" type="number" desc="How many fix iterations were needed"/>
+    <output name="unresolved_issues" type="array" desc="Any issues not resolved after fix attempts"/>
+    <output name="log_files" type="array" desc="Paths to iteration log files"/>
+  </outputs>
+
+  <error_handling>
+    <on_error action="checkpoint_rollback">
+      <condition>phases.safety.rollback_on_failure = true</condition>
+      <action>If checkpoint_mode = "worktree": Execute git checkout .claude/worktrees/ralph-checkpoint-{iteration} -- . (restore from snapshot)</action>
+      <action>If checkpoint_mode = "stash": Execute git checkout -- . &amp;&amp; git stash apply "stash@{/ralph-checkpoint-{iteration}}" (restore from stash)</action>
+      <action>Mark task as blocked</action>
+      <message>Iteration {iteration} failed - rolled back to checkpoint</message>
+    </on_error>
+    <on_timeout action="pause">
+      <message>Iteration {iteration} timed out after {timeout_minutes} minutes</message>
+    </on_timeout>
+    <on_test_failure action="retry">
+      <max_retries>{max_retries_per_task}</max_retries>
+      <message>Tests failed - retrying implementation</message>
+    </on_test_failure>
+  </error_handling>
+
+  <!-- ================================================================== -->
+  <!-- BACKEND EXECUTION REFERENCE                                        -->
+  <!-- ================================================================== -->
+  <backend_reference>
+    <backend name="codex">
+      <tool>Bash</tool>
+      <command>
+        LOG_FILE="{state_dir}/iterations/{iteration:03d}-{phase}.log"
+        codex exec -c approval_mode="full-auto" "{prompt}" > "$LOG_FILE" 2>&amp;1
+      </command>
+      <with_preset>
+        codex exec -c approval_mode="full-auto" \
+          -c model="{preset.model}" \
+          -c model_reasoning_effort="{preset.reasoning_effort}" \
+          "{prompt}" > "$LOG_FILE" 2>&amp;1
+      </with_preset>
+    </backend>
+
+    <backend name="gemini">
+      <tool>Bash</tool>
+      <command>
+        LOG_FILE="{state_dir}/iterations/{iteration:03d}-{phase}.log"
+        gemini -p "{prompt}" > "$LOG_FILE" 2>&amp;1
+      </command>
+    </backend>
+
+    <backend name="claude">
+      <!-- TOOL ROUTING ONLY: backend is already chosen by profile. This only picks Task vs Bash. -->
+      <!-- NOTE: Bash path rerouted from `claude -p` to `codex exec` post-June-15 (Anthropic subscription
+           no longer covers headless claude). Set NOUS_ALLOW_CLAUDE_API=1 to restore the legacy bash_command. -->
+      <tool>Task (if session=claude) OR Bash codex exec (if session=glm) — NO backend switching</tool>
+      <task_tool>
+        subagent_type="Software Developer"
+        prompt="{prompt}"
+      </task_tool>
+      <bash_command>
+        LOG_FILE="{state_dir}/iterations/{iteration:03d}-{phase}.log"
+        # Was: claude -p "{prompt}" — rerouted to codex exec (June-15 subscription cliff).
+        codex exec "{prompt}" > "$LOG_FILE" 2>&amp;1
+      </bash_command>
+    </backend>
+
+    <backend name="cg_d">
+      <!-- TOOL ROUTING ONLY: backend is already chosen by profile. This only picks Task vs Bash. -->
+      <tool>Task (if session=glm) OR Bash (if session=claude) — NO backend switching</tool>
+      <task_tool>
+        subagent_type="Software Developer"
+        prompt="{prompt}"
+      </task_tool>
+      <bash_command>
+        LOG_FILE="{state_dir}/iterations/{iteration:03d}-{phase}.log"
+        cg_d -p "{prompt}" > "$LOG_FILE" 2>&amp;1
+      </bash_command>
+    </backend>
+  </backend_reference>
+</task>

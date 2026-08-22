@@ -1,0 +1,567 @@
+<task id="{bmad_folder}/custom/orchestrator/tasks/subagent-execute.xml"
+      name="Execute Subagent">
+  <objective>Reliable multi-backend subagent execution with exit code capture, sentinel validation, retry/fallback, and structured output</objective>
+
+  <llm critical="true">
+    <mandate>Execute specified backend: claude (Task tool), gemini (CLI), or codex (CLI)</mandate>
+    <mandate>Return structured output with success status, changed files, and summary</mandate>
+    <mandate>Respect timeout limits via `timeout --signal=SIGTERM --kill-after=60` wrapper</mandate>
+    <mandate>Never modify files outside the specified story scope</mandate>
+    <mandate>Always run CLI backends SYNCHRONOUSLY — never use nohup or background (&amp;)</mandate>
+    <mandate>Always stage prompts in temp files first — pass via $(cat) to avoid shell escaping issues and enable size guards</mandate>
+    <mandate>Always inject sentinel file instruction into every subagent prompt</mandate>
+    <mandate>Track consecutive failures per backend; fall back to `codex exec` after 2 consecutive failures (override with NOUS_ALLOW_CLAUDE_API=1 to route through `claude -p` instead)</mandate>
+  </llm>
+
+  <inputs>
+    <input name="prompt" required="true" desc="Task to execute"/>
+    <input name="backend" required="true" desc="claude | gemini | codex — MUST be passed explicitly from resolved profile, never defaulted"/>
+    <input name="story_id" required="true" desc="Story identifier, used for temp files, sentinel files, and log naming"/>
+    <input name="agent_persona" required="false" desc="e.g., dev, sm for BMAD agent context"/>
+    <input name="workflow_path" required="false" desc="Path to workflow.yaml to execute"/>
+    <input name="story_path" required="false" desc="Story file for context"/>
+    <input name="timeout_minutes" default="30" desc="Max execution time"/>
+    <input name="lock_file" required="false" desc="Path to parallel lock file for coordination"/>
+    <input name="constraints" required="false" desc="Merged cannot_do/must_do constraints for this phase (from config.yaml constraints section)"/>
+    <input name="codex_agent" required="false" desc="Optional Codex agent name from .codex/agents/ (e.g., 'review-correctness', 'review-security'). When set, adds --agent flag to codex exec."/>
+    <input name="fix_scope" required="false" desc="Fix scope discriminator ('critical' or 'minor') for parallel fix workers. Used to disambiguate artifact paths when multiple fix agents run for the same story."/>
+    <input name="consecutive_failures" default="0" desc="Running count of consecutive failures for the current backend (caller tracks across invocations)"/>
+  </inputs>
+
+  <flow>
+    <!-- ================================================================== -->
+    <!-- STEP 1: Validate Backend, Load Context                             -->
+    <!-- ================================================================== -->
+    <step n="1" title="Validate Backend and Load Context">
+      <action>Validate backend parameter is one of: claude, gemini, codex</action>
+      <action>If story_path provided, read story file for context</action>
+      <action>If workflow_path provided, validate workflow exists</action>
+      <action>If lock_file provided, check lock before proceeding</action>
+      <action>Ensure output directories exist: `mkdir -p _bmad-output/implementation-artifacts`</action>
+      <action>Calculate TIMEOUT_SECONDS: `TIMEOUT_SECONDS=$((timeout_minutes * 60))`</action>
+      <action>Detect timeout command (macOS portability):
+        ```bash
+        # GNU timeout is required. On macOS, install via: brew install coreutils
+        if command -v timeout &gt; /dev/null 2&gt;&amp;1; then
+          TIMEOUT_CMD="timeout"
+        elif command -v gtimeout &gt; /dev/null 2&gt;&amp;1; then
+          TIMEOUT_CMD="gtimeout"
+        else
+          echo "WARNING: Neither timeout nor gtimeout found. Executing without timeout wrapper."
+          TIMEOUT_CMD=""
+        fi
+        ```
+      </action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 2: Check File Claims (Parallel Lock Coordination)             -->
+    <!-- ================================================================== -->
+    <step n="2" title="Check File Claims (If Lock Active)">
+      <check if="lock_file exists">
+        <action>Read lock file to get claimed files</action>
+        <action>Parse story for files to modify</action>
+        <action>If any target files already claimed by another story, HALT with conflict error</action>
+        <action>Claim our files in the lock (add to files_claimed)</action>
+        <action>Update heartbeat timestamp</action>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 2.5: Inject Phase Constraints into Prompt                     -->
+    <!-- ================================================================== -->
+    <step n="2.5" title="Inject Phase Constraints">
+      <check if="constraints provided">
+        <action>Append constraints block to prompt:
+          ```
+          ## Constraints (MANDATORY)
+          You CANNOT do any of the following:
+          {for each constraint in constraints.cannot_do: "- {constraint}"}
+
+          You MUST do all of the following:
+          {for each requirement in constraints.must_do: "- {requirement}"}
+          ```
+        </action>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 2.6: Compute Invocation Suffix for Parallel Safety            -->
+    <!-- When multiple workers run for the same story (e.g., 3 Codex        -->
+    <!-- reviewers, 2 fix agents), each needs unique artifact paths.        -->
+    <!-- ================================================================== -->
+    <step n="2.6" title="Compute Invocation Suffix">
+      <action>Compute per-invocation discriminator for artifact path uniqueness:
+        ```bash
+        # When codex_agent or fix_scope is set, include it in artifact paths
+        # to prevent collisions between parallel workers for the same story.
+        # Examples: .codex-review-correctness-story1.log, .codex-minor-story1.log
+        INVOCATION_SUFFIX=""
+        if [ -n "${codex_agent:-}" ]; then
+          INVOCATION_SUFFIX="-${codex_agent}"
+        elif [ -n "${fix_scope:-}" ]; then
+          INVOCATION_SUFFIX="-${fix_scope}"
+        fi
+        ```
+      </action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 2.7: Inject Sentinel File Instruction                         -->
+    <!-- Every subagent prompt gets this appended so we can verify          -->
+    <!-- completion independent of exit codes.                              -->
+    <!-- ================================================================== -->
+    <step n="2.7" title="Inject Completion Sentinel Instruction">
+      <action>Append the following to the prompt (ALL backends, including claude).
+        Use the INVOCATION_SUFFIX computed in step 2.6 for parallel-safe sentinel paths:
+        ```
+        ## Completion Sentinel (MANDATORY — DO NOT SKIP)
+        Your FINAL action before finishing must be to create this file:
+          `_bmad-output/.complete${INVOCATION_SUFFIX}-{story_id}.json`
+        with this exact JSON content:
+        {
+          "story_id": "{story_id}",
+          "status": "completed",
+          "files_changed": ["list", "of", "files", "you", "modified"],
+          "summary": "One-paragraph summary of what you did"
+        }
+        If you encounter an error that prevents completion, still create the file
+        but set status to "failed" and include an "error" field explaining why.
+        ```
+      </action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 2.8: Write Prompt to Temp File + Size Guard                   -->
+    <!-- Avoids shell argument length limits and escaping issues.           -->
+    <!-- ================================================================== -->
+    <step n="2.8" title="Write Prompt to Temp File and Check Size">
+      <action>Define prompt file path using INVOCATION_SUFFIX from step 2.6:
+        `PROMPT_FILE="/tmp/orchestrator-prompt-{story_id}-{backend}${INVOCATION_SUFFIX}.md"`</action>
+      <action>Write the fully-assembled prompt (with constraints + sentinel instruction) to PROMPT_FILE</action>
+      <action>Check prompt size:
+        ```bash
+        PROMPT_BYTES=$(wc -c &lt; "$PROMPT_FILE")
+        ```
+      </action>
+      <check if="PROMPT_BYTES > 500000">
+        <action>ABORT with error: "Prompt too large for {backend} ({PROMPT_BYTES} bytes, limit 500000)"</action>
+        <action>Set status to "failed", set error message, skip to step 5</action>
+      </check>
+      <check if="PROMPT_BYTES > 200000">
+        <action>Log WARNING: "Large prompt for {backend}: {PROMPT_BYTES} bytes — may degrade performance"</action>
+        <action>Continue execution (do not abort)</action>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 3: Execute Subagent (Synchronous + Timeout)                   -->
+    <!-- All CLI backends run synchronously with `timeout` wrapper.         -->
+    <!-- Exit codes are captured via $? immediately after execution.        -->
+    <!-- ================================================================== -->
+    <step n="3" title="Execute Subagent">
+      <action>Define common variables (INVOCATION_SUFFIX already computed in step 2.6):
+        ```bash
+        # INVOCATION_SUFFIX is set in step 2.6 — reuse it here for all artifact paths.
+        # All paths include the suffix so parallel workers don't collide.
+        LOG_FILE="_bmad-output/implementation-artifacts/.{backend}${INVOCATION_SUFFIX}-{story_id}.log"
+        SENTINEL="_bmad-output/.complete${INVOCATION_SUFFIX}-{story_id}.json"
+        PROMPT_FILE="/tmp/orchestrator-prompt-{story_id}-{backend}${INVOCATION_SUFFIX}.md"
+        TIMEOUT_SECONDS=$((timeout_minutes * 60))
+        ```
+      </action>
+
+      <!-- ---- Claude backend (Task tool) ---- -->
+      <check if="backend=claude">
+        <action>Build prompt with agent_persona context if specified</action>
+        <action>Use Claude Code Task tool with subagent_type="{agent_persona}" (default: "Software Developer")</action>
+        <action>Pass full prompt from PROMPT_FILE including story context and workflow reference</action>
+        <action>Monitor for timeout (timeout_minutes)</action>
+        <action>Capture Task tool success/failure as EXIT_CODE (0 = success, 1 = failure)</action>
+      </check>
+
+      <!-- ---- Gemini backend (synchronous CLI) ---- -->
+      <check if="backend=gemini">
+        <action>Determine if this is a REVIEW phase task (check if constraints or prompt contain "review" keywords)</action>
+        <action>Build command with file-based prompt and optional @file context:
+          ```bash
+          # For review tasks with story_path: use Gemini's @file syntax for direct file inclusion
+          # For implementation tasks: story context is already in the prompt file
+
+          if [review task AND story_path provided]; then
+            ${TIMEOUT_CMD:+$TIMEOUT_CMD --signal=SIGTERM --kill-after=60 $TIMEOUT_SECONDS} \
+              gemini -p "$(cat "$PROMPT_FILE")" @{story_path} \
+              > "$LOG_FILE" 2>&amp;1
+          else
+            ${TIMEOUT_CMD:+$TIMEOUT_CMD --signal=SIGTERM --kill-after=60 $TIMEOUT_SECONDS} \
+              gemini -p "$(cat "$PROMPT_FILE")" \
+              > "$LOG_FILE" 2>&amp;1
+          fi
+          EXIT_CODE=$?
+          ```
+        </action>
+        <action>CRITICAL: Run synchronously — do NOT background with &amp; or nohup</action>
+        <action>CRITICAL: Never read full log into context. On failure only: `tail -30 "$LOG_FILE"`</action>
+      </check>
+
+      <!-- ---- Codex backend (synchronous CLI) ---- -->
+      <check if="backend=codex">
+        <action>Build and execute command:
+          ```bash
+          # ALWAYS use --json to capture measured token usage from turn.completed events.
+          # Token data is extracted via parse_codex_jsonl_usage() after execution.
+          #
+          # If codex_agent is specified, use --agent flag to route to specialized agent
+          # from .codex/agents/{codex_agent}.toml (e.g., review-correctness, review-security).
+          # The agent config sets model, reasoning effort, and developer instructions.
+          CODEX_AGENT_FLAG=""
+          if [ -n "${codex_agent:-}" ]; then
+            CODEX_AGENT_FLAG="--agent ${codex_agent}"
+          fi
+
+          ${TIMEOUT_CMD:+$TIMEOUT_CMD --signal=SIGTERM --kill-after=60 $TIMEOUT_SECONDS} \
+            codex exec -c approval_mode="full-auto" $CODEX_AGENT_FLAG --json \
+            "$(cat "$PROMPT_FILE")" \
+            > "$LOG_FILE" 2>&amp;1
+          EXIT_CODE=$?
+          ```
+        </action>
+        <action>CRITICAL: Run synchronously — do NOT background with &amp; or nohup</action>
+        <action>CRITICAL: Uses `-c approval_mode="full-auto"` (NOT the deprecated `--full-auto` flag)</action>
+        <action>Parse JSONL for token usage and assign token_usage output:
+          ```bash
+          # Extract measured token counts from turn.completed events in JSONL log.
+          # Sum across all turns for multi-turn sessions.
+          read CODEX_INPUT_TOKENS CODEX_OUTPUT_TOKENS CODEX_CACHED_TOKENS &lt;&lt;&lt; \
+            $(grep '"turn.completed"' "$LOG_FILE" | python3 -c "
+          import sys, json
+          total_in, total_out, total_cached = 0, 0, 0
+          for line in sys.stdin:
+              ev = json.loads(line)
+              u = ev.get('usage', {})
+              total_in += u.get('input_tokens', 0)
+              total_out += u.get('output_tokens', 0)
+              total_cached += u.get('cached_input_tokens', 0)
+          print(f'{total_in} {total_out} {total_cached}')
+          ")
+
+          # Assign the token_usage output (returned to caller)
+          TOKEN_USAGE_MEASURED=true
+          ```
+        </action>
+        <action>Set the `token_usage` output from parsed values:
+          ```
+          token_usage = {
+            "input_tokens": CODEX_INPUT_TOKENS,
+            "output_tokens": CODEX_OUTPUT_TOKENS,
+            "cached_input_tokens": CODEX_CACHED_TOKENS,
+            "measured": true
+          }
+          ```
+          If CODEX_INPUT_TOKENS is empty or 0 (parsing failed), set token_usage to null
+          and log warning: "Could not parse token usage from Codex JSONL output"
+        </action>
+        <action>CRITICAL: Never read full log into context. On failure only: `tail -30 "$LOG_FILE"`</action>
+      </check>
+
+      <!-- ---- Interpret exit codes from timeout wrapper ---- -->
+      <action>Interpret EXIT_CODE (applies to gemini and codex backends):
+        - EXIT_CODE=0   → command completed normally
+        - EXIT_CODE=124 → timeout: SIGTERM was sent and process exited
+        - EXIT_CODE=137 → timeout: SIGKILL was sent (process ignored SIGTERM for 60s)
+        - EXIT_CODE!=0 (other) → command failed
+      </action>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 3.5: Error Classification + Retry / Mini-Executor Fallback    -->
+    <!-- Before incrementing failures, classify the error type. Patterns    -->
+    <!-- sourced from the engine's error-feedback module (the SSoT).        -->
+    <!--                                                                    -->
+    <!-- TRANSIENT (rate limit, network) → immediate fallback, no slot burn -->
+    <!-- PERMANENT (auth, CLI missing)   → halt pipeline, require user fix  -->
+    <!-- TOOL/LOGIC (everything else)    → existing count-based behavior    -->
+    <!-- ================================================================== -->
+    <error_classification>
+      <transient_patterns desc="Patterns from error_feedback.py _TRANSIENT_PATTERNS — retriable failures">
+        rate.?limit | 429 | Too.?Many.?Requests |
+        connection.?refused | connection.?reset | network.?timeout |
+        timed?\s*out | ETIMEDOUT | ECONNREFUSED | ECONNRESET |
+        503.*Service.*Unavailable | server\s+error |
+        temporarily.?unavailable | usage.?limit | hit.?your.*limit |
+        gemini.*timeout | gemini.*timed out | gemini.*killed
+      </transient_patterns>
+      <permanent_patterns desc="Setup/config failures that won't self-resolve">
+        auth.*error | authentication.*failed | invalid.*token | expired.*token |
+        command not found | No such file or directory |
+        permission denied.*(codex|gemini) | not installed |
+        EACCES | spawn.*ENOENT
+      </permanent_patterns>
+      <parse_failure_patterns desc="Codex --json output truncated or malformed — same backend, retry once with smaller chunk before falling back">
+        codex.*parse.*failed | JSONDecodeError | Unexpected end of JSON | Expecting value |
+        unterminated string | turn\.completed.*missing
+      </parse_failure_patterns>
+      <action_transient>Skip consecutive_failures increment. Sleep with jitter (1-3s), then attempt immediate backend fallback via `codex exec`.</action_transient>
+      <action_permanent>Halt pipeline. Report exact error to user. Do NOT retry or fall back.</action_permanent>
+      <action_parse_failure>Retry SAME backend ONCE with `--chunk-size` halved or prompt simplified (drop optional context). If retry also fails, escalate to transient handling (jitter + fallback). This is the specific remedy for the recurring `codex-parse-failed` portfolio signal.</action_parse_failure>
+      <action_tool_logic>Increment consecutive_failures. Follow existing retry logic below.</action_tool_logic>
+    </error_classification>
+
+    <step n="3.5" title="Error Classification + Retry with Mini-Executor Fallback">
+      <action>Initialize: RETRY_COUNT=0, FALLBACK_USED=false, ERROR_CLASS="unknown", PARSE_RETRY_USED=false</action>
+
+      <!-- Check parse failures across BOTH gemini and codex backends (codex --json can truncate) -->
+      <check if="EXIT_CODE != 0">
+        <action>Capture log tail for classification:
+          `ERROR_TAIL=$(tail -30 "$LOG_FILE" 2>/dev/null || echo "no log available")`
+        </action>
+
+        <!-- Specific recurring portfolio signal: codex-parse-failed -->
+        <check if="ERROR_TAIL matches parse_failure_patterns AND PARSE_RETRY_USED = false">
+          <action>Log: "PARSE FAILURE detected on {backend} — attempting same-backend retry with reduced context"</action>
+          <action>Set PARSE_RETRY_USED=true</action>
+          <action>Sleep with jitter to avoid thundering-herd: `sleep $(awk -v min=1 -v max=3 'BEGIN{srand(); print min+rand()*(max-min)}')`</action>
+          <action>Reduce prompt size for the retry:
+            ```bash
+            # Drop optional sections (constraints, sentinel) and try again — the
+            # most common cause of parse failures is prompt overflow, not real
+            # CLI error. Keep core task + boundaries only.
+            PROMPT_FILE_SMALL="/tmp/orchestrator-prompt-{story_id}-{backend}${INVOCATION_SUFFIX}-small.md"
+            head -100 "$PROMPT_FILE" > "$PROMPT_FILE_SMALL"
+            echo "" >> "$PROMPT_FILE_SMALL"
+            echo "## Completion Sentinel (MANDATORY)" >> "$PROMPT_FILE_SMALL"
+            echo "Final action: write _bmad-output/.complete${INVOCATION_SUFFIX}-{story_id}.json with status field." >> "$PROMPT_FILE_SMALL"
+            ```
+          </action>
+          <action>Re-execute SAME backend command with PROMPT_FILE_SMALL instead of PROMPT_FILE.
+            Capture new EXIT_CODE. If still non-zero, fall through to normal classification below
+            (which will treat it as transient + jitter-fallback since gemini-timeout / parse failures
+            both end up in transient_patterns).</action>
+          <action>Set RETRY_COUNT=1</action>
+        </check>
+      </check>
+
+      <check if="EXIT_CODE != 0 AND backend != codex">
+        <!-- Re-capture log tail in case the parse-retry above changed it -->
+        <action>ERROR_TAIL=$(tail -30 "$LOG_FILE" 2>/dev/null || echo "no log available")</action>
+        <action>Classify error by scanning ERROR_TAIL against patterns above:
+          ```
+          if ERROR_TAIL matches any transient_pattern (case-insensitive):
+            ERROR_CLASS = "transient"
+          elif ERROR_TAIL matches any permanent_pattern (case-insensitive):
+            ERROR_CLASS = "permanent"
+          else:
+            ERROR_CLASS = "tool_logic"
+          ```
+        </action>
+        <action>Log: "Backend {backend} failed — exit code {EXIT_CODE}, classified as {ERROR_CLASS}"</action>
+
+        <!-- PERMANENT: halt immediately, no retry -->
+        <check if="ERROR_CLASS = permanent">
+          <action>Set status = "failed", error = ERROR_TAIL</action>
+          <action>Log: "PERMANENT failure ({backend}): {ERROR_TAIL}. Pipeline halted — requires user intervention."</action>
+          <action>Do NOT increment consecutive_failures — this is not a retriable condition</action>
+          <action>Skip to step 5 (failure handling)</action>
+        </check>
+
+        <!-- TRANSIENT: skip failure counter, go straight to fallback (with jitter) -->
+        <check if="ERROR_CLASS = transient">
+          <action>Log: "TRANSIENT failure ({backend}): {ERROR_TAIL}. Skipping to fallback without burning failure slot."</action>
+          <action>Do NOT increment consecutive_failures</action>
+          <action>Sleep with jitter before fallback to avoid thundering-herd:
+            `sleep $(awk -v min=1 -v max=4 'BEGIN{srand(); print min+rand()*(max-min)}')`
+          </action>
+          <action>Emit a structured signal so the triage layer can see WHICH transient pattern fired (gemini-timeout, codex-parse-failed, rate-limit, etc.). Append to _bmad/ralph/events.ndjson:
+            ```bash
+            SIGNAL_NAME="unknown-transient"
+            if echo "$ERROR_TAIL" | grep -qiE "gemini.*timeout|gemini.*timed out|gemini.*killed"; then SIGNAL_NAME="gemini-timeout"; fi
+            if echo "$ERROR_TAIL" | grep -qiE "codex.*parse.*failed|JSONDecodeError|Unexpected end of JSON"; then SIGNAL_NAME="codex-parse-failed"; fi
+            if echo "$ERROR_TAIL" | grep -qiE "rate.?limit|429|Too.?Many.?Requests"; then SIGNAL_NAME="rate-limit"; fi
+            echo "{\"event\":\"orch:execution_failure\",\"backend\":\"{backend}\",\"error\":\"$SIGNAL_NAME\",\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" >> _bmad/ralph/events.ndjson 2>/dev/null || true
+            ```
+          </action>
+          <action>Set FALLBACK_USED=true and proceed directly to mini-executor fallback below</action>
+        </check>
+
+        <!-- TOOL/LOGIC: existing count-based behavior -->
+        <check if="ERROR_CLASS = tool_logic">
+          <action>Increment consecutive_failures count for this backend</action>
+
+          <check if="consecutive_failures &lt; 2">
+            <!-- First failure: report it, let caller decide whether to re-invoke -->
+            <action>Log: "Backend {backend} tool/logic failure (attempt {consecutive_failures}), exit code {EXIT_CODE}"</action>
+            <action>Do NOT retry inline — the caller workflow controls re-invocation</action>
+          </check>
+        </check>
+
+        <check if="(ERROR_CLASS = transient) OR (ERROR_CLASS = tool_logic AND consecutive_failures >= 2)">
+          <!-- Fallback: either transient (immediate) or 2+ consecutive tool/logic failures -->
+          <action>Set FALLBACK_USED=true</action>
+          <action>Capture partial output: `PARTIAL_OUTPUT=$(tail -30 "$LOG_FILE" 2>/dev/null || echo "no log available")`</action>
+          <action>Build sharpened fallback prompt:
+            ```
+            ## Fallback Execution (Original backend "{backend}" failed {consecutive_failures} times)
+
+            ### Original Task
+            {contents of PROMPT_FILE}
+
+            ### Failure Context
+            The original backend ({backend}) failed with exit code {EXIT_CODE}.
+            Last 30 lines of output:
+            ```
+            {PARTIAL_OUTPUT}
+            ```
+
+            ### Instructions
+            Complete the original task above. The sentinel file instruction is already included.
+            Focus on correctness over speed. If the task seems too large, implement the most
+            critical parts and document what remains in the sentinel file summary.
+            ```
+          </action>
+          <action>Write sharpened prompt to: `/tmp/orchestrator-prompt-{story_id}-fallback${INVOCATION_SUFFIX}.md`</action>
+          <action>Execute fallback via codex exec:
+            ```bash
+            FALLBACK_LOG="_bmad-output/implementation-artifacts/.fallback${INVOCATION_SUFFIX}-{story_id}.log"
+            # Swap backends freely: claude -p "$(cat ...)" works identically.
+            ${TIMEOUT_CMD:+$TIMEOUT_CMD --signal=SIGTERM --kill-after=60 $TIMEOUT_SECONDS} \
+              codex exec "$(cat /tmp/orchestrator-prompt-{story_id}-fallback${INVOCATION_SUFFIX}.md)" \
+              > "$FALLBACK_LOG" 2>&amp;1
+            EXIT_CODE=$?
+            LOG_FILE="$FALLBACK_LOG"
+            ```
+          </action>
+          <action>Set RETRY_COUNT=1</action>
+          <action>Log: "Fallback to codex exec completed with exit code {EXIT_CODE}"</action>
+        </check>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 4: Validate Results (Sentinel + Exit Code + Git)              -->
+    <!-- Primary success signal is the sentinel file, NOT exit code alone.  -->
+    <!-- ================================================================== -->
+    <step n="4" title="Collect and Validate Results">
+      <action>Reuse SENTINEL from step 3 (already includes INVOCATION_SUFFIX for parallel safety)</action>
+      <action>Check sentinel file existence: `SENTINEL_FOUND=$(test -f "$SENTINEL" &amp;&amp; echo true || echo false)`</action>
+
+      <!-- Determine composite status from exit code + sentinel -->
+      <action>Determine status:
+        ```
+        if EXIT_CODE = 124 or EXIT_CODE = 137:
+          status = "timeout"
+        elif EXIT_CODE != 0:
+          status = "failed"
+        elif SENTINEL_FOUND = false:
+          status = "incomplete"   # EXIT_CODE=0 but no proof of completion
+        elif SENTINEL_FOUND = true:
+          # Parse sentinel JSON for self-reported status
+          sentinel_status = parse JSON from SENTINEL → .status
+          if sentinel_status = "completed":
+            status = "completed"
+          elif sentinel_status = "failed":
+            status = "failed"  # Agent self-reported failure
+          else:
+            status = sentinel_status  # Pass through any other value
+        ```
+      </action>
+
+      <!-- If codex --json was used for review, also parse JSONL for validation -->
+      <check if="backend=codex AND review task AND EXIT_CODE=0">
+        <action>Parse final JSONL event from log file for additional completion signal:
+          ```bash
+          LAST_EVENT=$(tail -1 "$LOG_FILE")
+          # Cross-reference with sentinel: if JSONL says error but sentinel says completed,
+          # trust the sentinel (agent had more context about actual state)
+          ```
+        </action>
+      </check>
+
+      <action>Run git status to detect files changed</action>
+      <action>Extract list of modified files from git output</action>
+      <action>If sentinel exists, also merge files_changed from sentinel JSON</action>
+      <action>Generate execution summary</action>
+      <action>If lock_file active, release our file claims</action>
+
+      <!-- Propagate measured token usage to caller (Codex --json provides this) -->
+      <check if="token_usage is set AND token_usage.measured = true">
+        <action>Include token_usage in the output for the caller to record via cost tracker:
+          The caller (ralph-iterate or equivalent) MUST call cost_tracker.record() with:
+            - input_tokens = token_usage.input_tokens
+            - output_tokens = token_usage.output_tokens
+            - cached_input_tokens = token_usage.cached_input_tokens
+            - measured = true
+        </action>
+      </check>
+      <check if="token_usage is NOT set">
+        <action>Set token_usage = null (caller will use estimated counts instead)</action>
+      </check>
+    </step>
+
+    <!-- ================================================================== -->
+    <!-- STEP 5: Handle Failures and Edge Cases                             -->
+    <!-- ================================================================== -->
+    <step n="5" title="Handle Failures">
+      <check if="status = failed">
+        <action>Capture error message and stack trace if available</action>
+        <action>On CLI backends: `tail -30 "$LOG_FILE"` for diagnostics (NEVER read full log)</action>
+        <action>Preserve partial work information</action>
+      </check>
+      <check if="status = timeout">
+        <action>Record partial progress if detectable</action>
+        <action>Note: timeout --kill-after=60 means SIGTERM was sent, then SIGKILL after 60s</action>
+        <action>Check if sentinel was written before timeout (partial completion)</action>
+      </check>
+      <check if="status = incomplete">
+        <action>Log: "Subagent exited 0 but did not produce sentinel file — treating as incomplete"</action>
+        <action>On CLI backends: `tail -30 "$LOG_FILE"` for diagnostics</action>
+        <action>This is a new failure mode — caller should consider retry or escalation</action>
+      </check>
+      <check if="status = blocked">
+        <action>Include conflicting file and owner story in error</action>
+      </check>
+
+      <!-- Clean up temp files on completion (success or failure) -->
+      <action>Clean up prompt temp file: `rm -f "$PROMPT_FILE" /tmp/orchestrator-prompt-{story_id}-fallback${INVOCATION_SUFFIX}.md`</action>
+    </step>
+  </flow>
+
+  <outputs>
+    <output name="success" type="boolean" desc="True if status is 'completed'"/>
+    <output name="status" type="string" values="completed|failed|blocked|timeout|incomplete" desc="Execution result status. 'incomplete' = exit 0 but no sentinel file"/>
+    <output name="files_changed" type="array" desc="List of file paths modified during execution (merged from git status + sentinel)"/>
+    <output name="summary" type="string" desc="Human-readable summary of what was done"/>
+    <output name="error" type="string" desc="Error message if status is not completed"/>
+    <output name="execution_time_seconds" type="number" desc="How long the execution took"/>
+    <output name="log_file" type="string" desc="Path to log file for CLI backends (codex/gemini). Use tail -30 on failure only."/>
+    <output name="exit_code" type="number" desc="Raw exit code from the subagent process (0=success, 124=SIGTERM timeout, 137=SIGKILL timeout)"/>
+    <output name="retry_count" type="number" desc="How many retries were attempted (0 = first attempt succeeded or failed without retry)"/>
+    <output name="fallback_used" type="boolean" desc="Whether mini-executor fallback (codex exec instead of claude -p) was triggered (transient errors trigger immediately; tool/logic errors after 2 consecutive failures)"/>
+    <output name="error_class" type="string" values="transient|permanent|tool_logic|unknown" required="false" desc="Error classification from step 3.5. Transient = rate limit/network; permanent = auth/CLI missing; tool_logic = code/logic error"/>
+    <output name="sentinel_found" type="boolean" desc="Whether the completion sentinel file (_bmad-output/.complete-{story_id}.json) was found"/>
+    <output name="token_usage" type="object" required="false" desc="Measured token counts when available (codex --json). Fields: input_tokens, output_tokens, cached_input_tokens, measured (bool)"/>
+  </outputs>
+
+  <error_handling>
+    <on_error action="report">
+      <message>Subagent execution failed (tool/logic error) — see error output and log_file (tail -30 only) for details</message>
+    </on_error>
+    <on_transient action="fallback">
+      <message>Transient failure (rate limit / network) on {backend} — skipping to fallback without burning failure slot</message>
+    </on_transient>
+    <on_permanent action="halt">
+      <message>Permanent failure on {backend} (auth / CLI missing / setup error) — pipeline halted, requires user intervention</message>
+    </on_permanent>
+    <on_timeout action="abort">
+      <message>Subagent execution timed out after {timeout_minutes} minutes (SIGTERM sent, SIGKILL after 60s)</message>
+    </on_timeout>
+    <on_conflict action="halt">
+      <message>File conflict detected — another agent has claimed target files</message>
+    </on_conflict>
+    <on_prompt_too_large action="abort">
+      <message>Prompt exceeds size limit for {backend}: {PROMPT_BYTES} bytes (max 500000)</message>
+    </on_prompt_too_large>
+    <on_incomplete action="report">
+      <message>Subagent exited successfully but did not produce completion sentinel — execution may be incomplete</message>
+    </on_incomplete>
+  </error_handling>
+</task>
