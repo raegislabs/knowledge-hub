@@ -18,14 +18,18 @@ Browses best from the website: **[raegislabs.com/knowledge-hub](https://raegisla
 ```
 guides/
   ignition/     first-skill guides
-  orbit/        multi-CLI config, context optimisation, cross-CLI invocation, port assignment
-  deep-space/   agentic coding ecosystem, the Ralph loop, subagent sentinel validation
+  orbit/        multi-CLI config, context optimisation, cross-CLI invocation, port assignment,
+                deployment standards, secrets hygiene
+  deep-space/   agentic coding ecosystem, the Ralph loop, subagent sentinel validation,
+                agent-operated workflow design
 templates/
-  skills/       ready-to-adapt agent skill packs (qa, git-workflow, backend, frontend)
+  skills/       ready-to-adapt agent skill packs (qa, git-workflow, backend, frontend,
+                research, architecture, debugging, devops, project-ops, testing)
   agents/       AGENTS.md starters for multi-CLI agent config
 tools/
   prose-deai/   three-gate toolchain that strips AI tells from prose
   review-gate/  pre-push hook that routes your diff through an agent review
+  db-safe/      timestamped SQLite backup and migration scripts with retention
 ```
 
 ## Using the skill packs

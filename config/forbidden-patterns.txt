@@ -12,7 +12,7 @@ PEPS
 PARKROYAL|[Pp]arkroyal|[Pp]arkRoyal
 horwathhtl\.com
 # Singapore Hotels Association as a standalone acronym; git commit SHAs excluded
-(^|[^A-Za-z0-9-])SHA([^A-Za-z0-9-]|$) || new SHA|\$\{sha\}|\*\*SHA:\*\*
+(^|[^A-Za-z0-9-])SHA([^A-Za-z0-9-]|$) || new SHA|\$\{sha\}|\*\*SHA:\*\*|ommit SHA
 
 # --- Infrastructure ---
 # Any dotted quad, excluding loopback / bind-all / RFC1918 / link-local / CGNAT
@@ -29,8 +29,8 @@ ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}
 AKIA[A-Z0-9]{12,}
 xox[bpars]-
 infisical_[A-Za-z0-9_-]{8,}
-Bearer [A-Za-z0-9._-]{16,} || eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9|<token>|\$\{
-(api[_-]?key|secret|password|token)["']?[[:space:]]*[:=][[:space:]]*["'][^"'{$]{8,}["'] || changeme|CHANGE|<[^>]*>|\$\{|example|dummy|placeholder|YOUR_|your-password|your[-_]?token|ValidPass|WrongPass|eyJ|REPLACE
+Bearer [A-Za-z0-9._-]{16,} || eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9|<token>|\$\{|abc123def456
+(api[_-]?key|secret|password|token)["']?[[:space:]]*[:=][[:space:]]*["'][^"'{$]{8,}["'] || changeme|CHANGE|<[^>]*>|\$\{|example|dummy|placeholder|YOUR_|your[-_][a-z-]+|ValidPass|WrongPass|securepass|hashed_?pass|["']password["']|eyJ|REPLACE
 
 # --- Identity and internal markers ---
 @raegislabs\.com || john\.pates@raegislabs\.com
