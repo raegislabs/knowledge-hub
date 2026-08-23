@@ -14,6 +14,8 @@
 # a Mac before every push.
 #
 # Run before every push, and again against a fresh clone after pushing.
+# The scan covers tracked AND untracked-but-not-ignored files, so new content
+# is checked even if you forget `git add` first.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
@@ -25,17 +27,18 @@ if [ ! -f "$PATTERNS" ]; then
   exit 2
 fi
 
-# Tracked files, minus the pattern file itself. Filenames here contain no
-# spaces or newlines, so newline -> NUL translation is safe.
-mapfile_list() { git ls-files | grep -v "$SELF_EXCLUDE" | tr '\n' '\0'; }
+# Tracked + untracked (non-ignored) files, minus the pattern file itself.
+# Filenames here contain no spaces or newlines, so newline -> NUL translation
+# is safe.
+list_files() { { git ls-files; git ls-files --others --exclude-standard; } | sort -u | grep -v "$SELF_EXCLUDE"; }
 
-if [ -z "$(git ls-files)" ]; then
-  echo "sanitize-check: no tracked files yet — nothing to scan"
+if [ -z "$(list_files)" ]; then
+  echo "sanitize-check: no files to scan"
   exit 0
 fi
 
 FAIL=0
-SCANNED=$(git ls-files | grep -v "$SELF_EXCLUDE" | wc -l | tr -d ' ')
+SCANNED=$(list_files | wc -l | tr -d ' ')
 
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ""|\#*) continue ;; esac
@@ -55,7 +58,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   exclusion="${exclusion#"${exclusion%%[![:space:]]*}"}"
   [ -z "$pattern" ] && continue
 
-  hits=$(git ls-files | grep -v "$SELF_EXCLUDE" | tr '\n' '\0' \
+  hits=$(list_files | tr '\n' '\0' \
          | xargs -0 grep -InE -- "$pattern" 2>/dev/null || true)
   if [ -n "$exclusion" ] && [ -n "$hits" ]; then
     hits=$(printf '%s\n' "$hits" | grep -vE -- "$exclusion" || true)
@@ -70,6 +73,6 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$PATTERNS"
 
 if [ "$FAIL" -eq 0 ]; then
-  echo "sanitize-check: clean ($SCANNED tracked files scanned)"
+  echo "sanitize-check: clean ($SCANNED files scanned)"
 fi
 exit "$FAIL"
