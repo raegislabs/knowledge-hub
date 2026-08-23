@@ -69,8 +69,10 @@ restriction, not the capability.
 
 ## The example skills
 
-`fpl-status.md` and `fpl-transfer.md` in this directory are lightly
-edited versions of real skills from the fantasy-football system. Notice
+`fpl-status.md`, `fpl-transfer.md` and `fpl-review.md` in this directory
+are lightly edited versions of real skills from the fantasy-football
+system — status, decision and review being the three archetypes of the
+pattern. Notice
 how little they do besides: run the command, read the report, report back
 in a fixed shape, and refuse to take unrequested actions. The restraint
 is the design. A skill that says "do not run the next command unless

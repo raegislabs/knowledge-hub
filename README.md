@@ -19,7 +19,7 @@ Browses best from the website: **[raegislabs.com/knowledge-hub](https://raegisla
 guides/
   ignition/     first-skill guides
   orbit/        multi-CLI config, context optimisation, cross-CLI invocation, port assignment,
-                deployment standards, secrets hygiene
+                deployment standards, secrets hygiene, Traefik file routing, platform onboarding
   deep-space/   agentic coding ecosystem, the Ralph loop, subagent sentinel validation,
                 agent-operated workflow design
 templates/
