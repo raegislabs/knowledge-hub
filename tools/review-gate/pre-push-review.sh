@@ -5,7 +5,7 @@
 # Runs a Codex code review on changes being pushed to protected branches.
 # Replaces GitHub Actions-based reviews — enforced at the developer machine.
 #
-# Install:  scripts/install-review-hook.sh   (from agent-orchestration-framework)
+# Install:  tools/review-gate/install-review-hook.sh
 # Manual:   scripts/pre-push-review.sh [--skip] [--model MODEL] [--effort EFFORT]
 #
 # Configuration (env vars or .codex-review.conf):
@@ -35,24 +35,62 @@ else
     RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' NC=''
 fi
 
-# --- Load project-level config if present ---
+# --- Load project-level config without executing it ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || dirname "$SCRIPT_DIR")"
 CONFIG_FILE="${REPO_ROOT}/.codex-review.conf"
 
+CONFIG_CODEX_REVIEW_MODEL=""
+CONFIG_CODEX_REVIEW_EFFORT=""
+CONFIG_CODEX_REVIEW_BRANCHES="main master"
+CONFIG_CODEX_REVIEW_SKIP="0"
+CONFIG_CODEX_REVIEW_MAX_DIFF="2000"
+CONFIG_CODEX_REVIEW_TIMEOUT="300"
+CONFIG_CODEX_REVIEW_LOG="1"
+
+trim_space() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
 if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    while IFS= read -r config_line || [[ -n "$config_line" ]]; do
+        config_line="$(trim_space "${config_line%%#*}")"
+        [[ -z "$config_line" ]] && continue
+        if [[ "$config_line" != *=* ]]; then
+            echo -e "${YELLOW}[codex-review] Ignoring malformed config line: ${config_line}${NC}" >&2
+            continue
+        fi
+
+        config_key="$(trim_space "${config_line%%=*}")"
+        config_value="$(trim_space "${config_line#*=}")"
+        if [[ "$config_value" == \"*\" && "$config_value" == *\" ]]; then
+            config_value="${config_value:1:${#config_value}-2}"
+        elif [[ "$config_value" == \'*\' && "$config_value" == *\' ]]; then
+            config_value="${config_value:1:${#config_value}-2}"
+        fi
+
+        case "$config_key" in
+            CODEX_REVIEW_MODEL|CODEX_REVIEW_EFFORT|CODEX_REVIEW_BRANCHES|CODEX_REVIEW_SKIP|CODEX_REVIEW_MAX_DIFF|CODEX_REVIEW_TIMEOUT|CODEX_REVIEW_LOG)
+                printf -v "CONFIG_${config_key}" '%s' "$config_value"
+                ;;
+            *)
+                echo -e "${YELLOW}[codex-review] Ignoring unsupported config key: ${config_key}${NC}" >&2
+                ;;
+        esac
+    done < "$CONFIG_FILE"
 fi
 
-# --- Defaults (inherit from ~/.codex/config.toml unless overridden) ---
-CODEX_REVIEW_MODEL="${CODEX_REVIEW_MODEL:-}"
-CODEX_REVIEW_EFFORT="${CODEX_REVIEW_EFFORT:-}"
-CODEX_REVIEW_BRANCHES="${CODEX_REVIEW_BRANCHES:-main master}"
-CODEX_REVIEW_SKIP="${CODEX_REVIEW_SKIP:-0}"
-CODEX_REVIEW_MAX_DIFF="${CODEX_REVIEW_MAX_DIFF:-2000}"
-CODEX_REVIEW_TIMEOUT="${CODEX_REVIEW_TIMEOUT:-300}"
-CODEX_REVIEW_LOG="${CODEX_REVIEW_LOG:-1}"
+# Environment values override the config file; CLI flags override both.
+CODEX_REVIEW_MODEL="${CODEX_REVIEW_MODEL:-$CONFIG_CODEX_REVIEW_MODEL}"
+CODEX_REVIEW_EFFORT="${CODEX_REVIEW_EFFORT:-$CONFIG_CODEX_REVIEW_EFFORT}"
+CODEX_REVIEW_BRANCHES="${CODEX_REVIEW_BRANCHES:-$CONFIG_CODEX_REVIEW_BRANCHES}"
+CODEX_REVIEW_SKIP="${CODEX_REVIEW_SKIP:-$CONFIG_CODEX_REVIEW_SKIP}"
+CODEX_REVIEW_MAX_DIFF="${CODEX_REVIEW_MAX_DIFF:-$CONFIG_CODEX_REVIEW_MAX_DIFF}"
+CODEX_REVIEW_TIMEOUT="${CODEX_REVIEW_TIMEOUT:-$CONFIG_CODEX_REVIEW_TIMEOUT}"
+CODEX_REVIEW_LOG="${CODEX_REVIEW_LOG:-$CONFIG_CODEX_REVIEW_LOG}"
 
 # --- Parse CLI args ---
 while [[ $# -gt 0 ]]; do
@@ -66,6 +104,19 @@ while [[ $# -gt 0 ]]; do
         *)            shift ;;  # ignore unknown args (git passes remote name/url)
     esac
 done
+
+if [[ ! "$CODEX_REVIEW_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo -e "${RED}[codex-review] CODEX_REVIEW_TIMEOUT must be a positive integer.${NC}" >&2
+    exit 2
+fi
+if [[ ! "$CODEX_REVIEW_MAX_DIFF" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}[codex-review] CODEX_REVIEW_MAX_DIFF must be a non-negative integer.${NC}" >&2
+    exit 2
+fi
+if [[ ! "$CODEX_REVIEW_SKIP" =~ ^[01]$ || ! "$CODEX_REVIEW_LOG" =~ ^[01]$ ]]; then
+    echo -e "${RED}[codex-review] CODEX_REVIEW_SKIP and CODEX_REVIEW_LOG must be 0 or 1.${NC}" >&2
+    exit 2
+fi
 
 # --- Skip check ---
 if [[ "$CODEX_REVIEW_SKIP" == "1" ]]; then
@@ -84,16 +135,21 @@ fi
 # We collect ALL protected refs being pushed, not just the last one.
 PROTECTED_TARGETS=()
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+TARGET_LOCAL_OID=""
+TARGET_REMOTE_OID=""
+ZERO_OID="0000000000000000000000000000000000000000"
 
 if ! tty -s 2>/dev/null; then
-    while IFS= read -r line; do
-        local_ref=$(echo "$line" | awk '{print $1}')
-        remote_ref=$(echo "$line" | awk '{print $3}')
+    while IFS=' ' read -r _local_ref local_sha remote_ref remote_sha; do
         target="${remote_ref##refs/heads/}"
 
         for branch in $CODEX_REVIEW_BRANCHES; do
             if [[ "$target" == "$branch" ]]; then
                 PROTECTED_TARGETS+=("$target")
+                if [[ -z "$TARGET_LOCAL_OID" ]]; then
+                    TARGET_LOCAL_OID="$local_sha"
+                    TARGET_REMOTE_OID="$remote_sha"
+                fi
                 break
             fi
         done
@@ -105,6 +161,7 @@ if [[ ${#PROTECTED_TARGETS[@]} -eq 0 ]]; then
     for branch in $CODEX_REVIEW_BRANCHES; do
         if [[ "$CURRENT_BRANCH" == "$branch" ]]; then
             PROTECTED_TARGETS+=("$branch")
+            TARGET_LOCAL_OID="$(git rev-parse HEAD)"
             break
         fi
     done
@@ -119,20 +176,30 @@ fi
 # Use the first protected target for diffing (typically there's only one)
 TARGET_BRANCH="${PROTECTED_TARGETS[0]}"
 
-# --- Find the merge base to diff against ---
-MERGE_BASE="origin/${TARGET_BRANCH}"
-if ! git rev-parse "$MERGE_BASE" &>/dev/null; then
-    MERGE_BASE="$TARGET_BRANCH"
+if [[ "$TARGET_LOCAL_OID" == "$ZERO_OID" ]]; then
+    echo -e "${RED}[codex-review] Refusing to delete protected branch '${TARGET_BRANCH}'.${NC}" >&2
+    exit 1
+fi
+
+# Prefer the remote object ID supplied by the pre-push protocol. Remote-tracking
+# references can be stale, especially when the hook runs before a fetch.
+if [[ "$TARGET_REMOTE_OID" == "$ZERO_OID" ]]; then
+    EMPTY_TREE_OID="$(git hash-object -t tree /dev/null)"
+    DIFF_RANGE="${EMPTY_TREE_OID}..${TARGET_LOCAL_OID}"
+elif [[ -n "$TARGET_REMOTE_OID" ]] \
+    && git cat-file -e "${TARGET_REMOTE_OID}^{commit}" 2>/dev/null; then
+    DIFF_RANGE="${TARGET_REMOTE_OID}..${TARGET_LOCAL_OID}"
+else
+    MERGE_BASE="origin/${TARGET_BRANCH}"
+    if ! git rev-parse "$MERGE_BASE" &>/dev/null; then
+        MERGE_BASE="$TARGET_BRANCH"
+    fi
+    DIFF_RANGE="${MERGE_BASE}...${TARGET_LOCAL_OID}"
 fi
 
 # --- Compute diff stats (safely, without set -e pipeline issues) ---
-DIFF_STAT=$(git diff --stat "${MERGE_BASE}...HEAD" 2>/dev/null) || \
-DIFF_STAT=$(git diff --stat "${MERGE_BASE}" HEAD 2>/dev/null) || \
-DIFF_STAT=""
-
-DIFF_CONTENT=$(git diff "${MERGE_BASE}...HEAD" 2>/dev/null) || \
-DIFF_CONTENT=$(git diff "${MERGE_BASE}" HEAD 2>/dev/null) || \
-DIFF_CONTENT=""
+DIFF_STAT=$(git diff --stat "$DIFF_RANGE" 2>/dev/null) || DIFF_STAT=""
+DIFF_CONTENT=$(git diff "$DIFF_RANGE" 2>/dev/null) || DIFF_CONTENT=""
 
 DIFF_LINES=$(echo "$DIFF_CONTENT" | wc -l | tr -d ' ')
 
@@ -142,14 +209,14 @@ if [[ -z "$DIFF_CONTENT" || "$DIFF_LINES" == "0" ]]; then
 fi
 
 # --- Build codex command ---
-CODEX_CMD=(codex exec)
+CODEX_CMD=(codex exec --sandbox read-only --ephemeral --color never)
 
 if [[ -n "$CODEX_REVIEW_MODEL" ]]; then
     CODEX_CMD+=(--model "$CODEX_REVIEW_MODEL")
 fi
 
 if [[ -n "$CODEX_REVIEW_EFFORT" ]]; then
-    CODEX_CMD+=(--reasoning-effort "$CODEX_REVIEW_EFFORT")
+    CODEX_CMD+=(-c "model_reasoning_effort=\"${CODEX_REVIEW_EFFORT}\"")
 fi
 
 # --- Large diff warning ---
@@ -159,9 +226,7 @@ if [[ "$DIFF_LINES" -gt "$CODEX_REVIEW_MAX_DIFF" ]]; then
 fi
 
 # --- Build the review prompt ---
-FILES_CHANGED=$(git diff --name-only "${MERGE_BASE}...HEAD" 2>/dev/null) || \
-FILES_CHANGED=$(git diff --name-only "${MERGE_BASE}" HEAD 2>/dev/null) || \
-FILES_CHANGED="unknown"
+FILES_CHANGED=$(git diff --name-only "$DIFF_RANGE" 2>/dev/null) || FILES_CHANGED="unknown"
 
 FILE_COUNT=$(echo "$FILES_CHANGED" | wc -l | tr -d ' ')
 
@@ -174,7 +239,7 @@ ${FILES_CHANGED}
 ${DIFF_STAT}
 
 ## Instructions:
-Review the git diff for this branch (use git diff ${MERGE_BASE}...HEAD) and check for:
+Review the git diff for this branch (use git diff ${DIFF_RANGE}) and check for:
 1. **Bugs & logic errors** — incorrect behavior, off-by-one, null handling
 2. **Security issues** — injection, auth bypass, secrets in code
 3. **Breaking changes** — API contract changes, migration safety
@@ -316,11 +381,20 @@ ${REVIEW_OUTPUT}
 \`\`\`
 LOGEOF
 
-    # Prune old logs (keep last 50)
-    local count
-    count=$(ls -1 "$log_dir"/*.md 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "$count" -gt 50 ]]; then
-        ls -1t "$log_dir"/*.md | tail -n +"51" | xargs rm -f
+    # Filenames begin with a sortable timestamp. Remove the oldest entries
+    # without parsing `ls` output.
+    local log_files=()
+    local old_log
+    local remove_count
+    while IFS= read -r old_log; do
+        log_files+=("$old_log")
+    done < <(find "$log_dir" -maxdepth 1 -type f -name '*.md' -print | sort)
+    remove_count=$(( ${#log_files[@]} - 50 ))
+    if [[ "$remove_count" -gt 0 ]]; then
+        local index
+        for ((index = 0; index < remove_count; index++)); do
+            rm -f "${log_files[$index]}"
+        done
     fi
 }
 

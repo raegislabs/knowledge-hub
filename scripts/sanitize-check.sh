@@ -17,7 +17,9 @@
 # The scan covers tracked AND untracked-but-not-ignored files, so new content
 # is checked even if you forget `git add` first.
 set -uo pipefail
-cd "$(git rev-parse --show-toplevel)" || exit 2
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT" || exit 2
 
 PATTERNS="config/forbidden-patterns.txt"
 SELF_EXCLUDE='^config/forbidden-patterns\.txt$'   # the pattern file matches itself by design

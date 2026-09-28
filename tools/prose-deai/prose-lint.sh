@@ -4,7 +4,7 @@
 # Catches only what a regex can identify reproducibly. Hard punctuation and
 # empty formulas fail. Favorite words, action inflation, and generated cadence
 # are contextual candidates for reading rather than automatic violations.
-# Structural tells remain in ref-prose-deslop.md and the Book Gen style audit.
+# Structural tells remain in the manual review at ref-prose-deslop.md.
 #
 # Usage:
 #   prose-lint.sh FILE [FILE...]
@@ -30,6 +30,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 TMP=""; OUT=""; HARD_OUT=""; CANDIDATE_OUT=""
+# Invoked by the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() {
   [[ -n "$TMP" ]] && rm -f "$TMP"
   [[ -n "$OUT" ]] && rm -f "$OUT"
@@ -108,11 +110,11 @@ if [[ $QUIET -eq 0 ]]; then
   echo
   if [[ $HARD_HITS -eq 0 && $CANDIDATE_HITS -eq 0 ]]; then
     echo "prose-lint: clean (0 hard failures, 0 contextual candidates)"
-    echo "Structural tells are checked by the de-ai and Book Gen style reviews."
+    echo "Structural tells require the manual review in ref-prose-deslop.md."
   else
     echo "prose-lint: $HARD_HITS hard failure(s), $CANDIDATE_HITS contextual candidate(s)"
     echo "Read contextual candidates for fit, frequency, and clustering before editing."
-    echo "Structural tells are checked by the de-ai and Book Gen style reviews."
+    echo "Structural tells require the manual review in ref-prose-deslop.md."
   fi
 fi
 

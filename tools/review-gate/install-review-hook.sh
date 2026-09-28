@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --target DIR   Target repo directory (default: current directory)"
             echo "  --dry-run      Show what would be done without doing it"
-            echo "  --uninstall    Remove the hook and config"
+            echo "  --uninstall    Remove the installed hook and restore saved files"
             exit 0
             ;;
         *)           shift ;;
@@ -71,23 +71,49 @@ if ! git -C "$TARGET_DIR" rev-parse --show-toplevel &>/dev/null; then
 fi
 
 REPO_ROOT="$(git -C "$TARGET_DIR" rev-parse --show-toplevel)"
-HOOKS_DIR="${REPO_ROOT}/.git/hooks"
+HOOKS_PATH="$(git -C "$REPO_ROOT" rev-parse --git-path hooks)"
+case "$HOOKS_PATH" in
+    /*) HOOKS_DIR="$HOOKS_PATH" ;;
+    *)  HOOKS_DIR="${REPO_ROOT}/${HOOKS_PATH}" ;;
+esac
 SCRIPTS_DIR="${REPO_ROOT}/scripts"
 HOOK_FILE="${HOOKS_DIR}/pre-push"
 SCRIPT_FILE="${SCRIPTS_DIR}/pre-push-review.sh"
 CONFIG_FILE="${REPO_ROOT}/.codex-review.conf"
+HOOK_BACKUP="${HOOK_FILE}.before-codex-review"
+SCRIPT_BACKUP="${SCRIPT_FILE}.before-codex-review"
+HOOK_MARKER="Installed by: raegislabs/knowledge-hub review-gate"
 
 # --- Uninstall ---
 if [[ "$UNINSTALL" == "1" ]]; then
     echo -e "${BOLD}Uninstalling Codex review hook from ${REPO_ROOT}${NC}"
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        echo -e "${BLUE}  [dry-run] Would remove: ${HOOK_FILE}${NC}"
-        echo -e "${BLUE}  [dry-run] Would remove: ${SCRIPT_FILE}${NC}"
+        echo -e "${BLUE}  [dry-run] Would remove the installed hook and script${NC}"
+        echo -e "${BLUE}  [dry-run] Would restore any saved hook and script backups${NC}"
         echo -e "${BLUE}  [dry-run] Would keep:   ${CONFIG_FILE} (manual removal)${NC}"
     else
-        rm -f "$HOOK_FILE" && echo -e "${GREEN}  Removed: ${HOOK_FILE}${NC}" || true
-        rm -f "$SCRIPT_FILE" && echo -e "${GREEN}  Removed: ${SCRIPT_FILE}${NC}" || true
+        if [[ -f "$HOOK_FILE" ]] && grep -qF "$HOOK_MARKER" "$HOOK_FILE"; then
+            rm -f "$HOOK_FILE"
+            echo -e "${GREEN}  Removed: ${HOOK_FILE}${NC}"
+        elif [[ -f "$HOOK_FILE" ]]; then
+            echo -e "${YELLOW}  Kept unrecognised hook: ${HOOK_FILE}${NC}"
+        fi
+        if [[ -f "$HOOK_BACKUP" ]]; then
+            mv "$HOOK_BACKUP" "$HOOK_FILE"
+            echo -e "${GREEN}  Restored: ${HOOK_FILE}${NC}"
+        fi
+
+        if [[ -f "$SCRIPT_FILE" ]] && grep -qF 'pre-push-review.sh — Local Codex code review' "$SCRIPT_FILE"; then
+            rm -f "$SCRIPT_FILE"
+            echo -e "${GREEN}  Removed: ${SCRIPT_FILE}${NC}"
+        elif [[ -f "$SCRIPT_FILE" ]]; then
+            echo -e "${YELLOW}  Kept unrecognised script: ${SCRIPT_FILE}${NC}"
+        fi
+        if [[ -f "$SCRIPT_BACKUP" ]]; then
+            mv "$SCRIPT_BACKUP" "$SCRIPT_FILE"
+            echo -e "${GREEN}  Restored: ${SCRIPT_FILE}${NC}"
+        fi
         echo -e "${YELLOW}  Kept: ${CONFIG_FILE} (remove manually if desired)${NC}"
     fi
     echo -e "${GREEN}Done.${NC}"
@@ -113,34 +139,69 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo -e "${BLUE}  [dry-run] Would copy:   ${CANONICAL_SCRIPT} → ${SCRIPT_FILE}${NC}"
 else
     mkdir -p "$SCRIPTS_DIR"
+    if [[ -f "$SCRIPT_FILE" ]] && ! grep -qF 'pre-push-review.sh — Local Codex code review' "$SCRIPT_FILE"; then
+        if [[ -f "$SCRIPT_BACKUP" ]]; then
+            echo -e "${RED}Error: script backup already exists at ${SCRIPT_BACKUP}${NC}" >&2
+            exit 1
+        fi
+        mv "$SCRIPT_FILE" "$SCRIPT_BACKUP"
+        echo -e "${YELLOW}  Saved existing script: ${SCRIPT_BACKUP}${NC}"
+    fi
     cp "$CANONICAL_SCRIPT" "$SCRIPT_FILE"
     chmod +x "$SCRIPT_FILE"
     echo -e "${GREEN}  Copied: ${SCRIPT_FILE}${NC}"
 fi
 
 # 2. Create the git hook (thin wrapper)
+# Variables belong to the generated hook.
+# shellcheck disable=SC2016
 HOOK_CONTENT='#!/usr/bin/env bash
 # Git pre-push hook — delegates to scripts/pre-push-review.sh
-# Installed by: agent-orchestration-framework/scripts/install-review-hook.sh
+# Installed by: raegislabs/knowledge-hub review-gate
 # To bypass: git push --no-verify
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 REVIEW_SCRIPT="${REPO_ROOT}/scripts/pre-push-review.sh"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREVIOUS_HOOK="${HOOK_DIR}/pre-push.before-codex-review"
+REFS_FILE="$(mktemp "${TMPDIR:-/tmp}/codex-pre-push.XXXXXX")"
+
+cleanup() {
+    rm -f "$REFS_FILE"
+}
+trap cleanup EXIT
+cat > "$REFS_FILE"
+
+if [[ -x "$PREVIOUS_HOOK" ]]; then
+    if "$PREVIOUS_HOOK" "$@" < "$REFS_FILE"; then
+        :
+    else
+        status=$?
+        echo "[pre-push] Existing hook failed. Codex review was not run." >&2
+        exit "$status"
+    fi
+fi
 
 if [[ -f "$REVIEW_SCRIPT" ]]; then
-    exec "$REVIEW_SCRIPT" "$@"
+    "$REVIEW_SCRIPT" "$@" < "$REFS_FILE"
 else
-    echo "[pre-push] Review script not found at ${REVIEW_SCRIPT}. Skipping."
-    exit 0
+    echo "[pre-push] Review script not found at ${REVIEW_SCRIPT}. Push blocked." >&2
+    exit 1
 fi'
 
 if [[ "$DRY_RUN" == "1" ]]; then
     echo -e "${BLUE}  [dry-run] Would create: ${HOOK_FILE}${NC}"
 else
-    # Check for existing pre-push hook
-    if [[ -f "$HOOK_FILE" ]]; then
-        echo -e "${YELLOW}  Existing pre-push hook found. Backing up to ${HOOK_FILE}.bak${NC}"
-        cp "$HOOK_FILE" "${HOOK_FILE}.bak"
+    mkdir -p "$HOOKS_DIR"
+    # Save an existing hook once. Reinstalling our own hook does not replace
+    # the original backup.
+    if [[ -f "$HOOK_FILE" ]] && ! grep -qF "$HOOK_MARKER" "$HOOK_FILE"; then
+        if [[ -f "$HOOK_BACKUP" ]]; then
+            echo -e "${RED}Error: hook backup already exists at ${HOOK_BACKUP}${NC}" >&2
+            exit 1
+        fi
+        mv "$HOOK_FILE" "$HOOK_BACKUP"
+        echo -e "${YELLOW}  Saved existing hook: ${HOOK_BACKUP}${NC}"
     fi
 
     echo "$HOOK_CONTENT" > "$HOOK_FILE"
@@ -152,8 +213,8 @@ fi
 if [[ ! -f "$CONFIG_FILE" ]]; then
     CONFIG_CONTENT='# Codex Pre-Push Review Configuration
 # =====================================
-# Sourced by scripts/pre-push-review.sh
-# All values are optional — unset values inherit from ~/.codex/config.toml
+# Parsed as data by scripts/pre-push-review.sh; shell expressions are not run
+# All values are optional; unset model values inherit from ~/.codex/config.toml
 
 # Model override (leave empty to use ~/.codex/config.toml default)
 # CODEX_REVIEW_MODEL=""
@@ -188,14 +249,15 @@ fi
 
 # 4. Ensure .codex-review-log/ is in .gitignore
 GITIGNORE="${REPO_ROOT}/.gitignore"
-if [[ -f "$GITIGNORE" ]]; then
-    if ! grep -qF '.codex-review-log/' "$GITIGNORE" 2>/dev/null; then
-        if [[ "$DRY_RUN" == "1" ]]; then
-            echo -e "${BLUE}  [dry-run] Would add '.codex-review-log/' to ${GITIGNORE}${NC}"
-        else
-            echo '.codex-review-log/' >> "$GITIGNORE"
-            echo -e "${GREEN}  Added '.codex-review-log/' to .gitignore${NC}"
+if ! grep -qF '.codex-review-log/' "$GITIGNORE" 2>/dev/null; then
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo -e "${BLUE}  [dry-run] Would add '.codex-review-log/' to ${GITIGNORE}${NC}"
+    else
+        if [[ -s "$GITIGNORE" ]]; then
+            printf '\n' >> "$GITIGNORE"
         fi
+        printf '%s\n' '# Local Codex review logs' '.codex-review-log/' >> "$GITIGNORE"
+        echo -e "${GREEN}  Added '.codex-review-log/' to .gitignore${NC}"
     fi
 fi
 

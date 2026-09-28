@@ -1,89 +1,102 @@
-# Agent-Operated Workflows
+# Agent-Operated Workflow Design
 
-Most "AI automation" gives the agent a UI to fumble through or a pile of
-scripts it reads and hopes to run in the right order. There is a better
-shape: design the workflow so an *agent* is its intended operator, the way
-UNIX tools are designed for a shell.
+Design a repeat workflow around an explicit operator contract. The agent should
+ask the system for status, make validated changes through commands and receive
+machine-readable outcomes. It should not infer the procedure from a folder of
+scripts.
 
-This directory documents the conventions, drawn from a season-long
-decision system (a fantasy-football pipeline run entirely by agent) but
-applicable to any repeat decision process: a weekly trading review, a
-content pipeline, an ops rota.
+The examples in this directory come from a season-long fantasy-football
+decision system. The same contracts fit recurring research, portfolio review,
+content operations and service checks.
 
----
+## 1. One status command is the front door
 
-## The conventions
-
-### 1. One front-door command
-
-```
+```console
 $ workflow status
 ```
 
-A single command reports where the workflow is, what is ready, what is
-missing, and the next command to run. The agent never has to remember the
-map — it asks. This is the difference between a 15-skill pile and a system.
+The response states:
 
-### 2. State changes only through commands, every one with a reason
+- current phase and freshness
+- satisfied and missing prerequisites
+- next permitted command
+- paths to the human and machine-readable evidence
 
+The agent asks for current state instead of carrying a stale process map in
+context.
+
+## 2. Mutations require a command and a reason
+
+```console
+$ workflow state set-free-transfers 2 --reason "read from source on 2026-01-03"
 ```
-$ workflow state set-free-transfers 2 --reason "read off the site 2026-01-03"
-```
 
-No editing state files by hand, ever. Every mutation goes through a command
-that validates it and records *why*. When something is wrong three weeks
-later, the reason log is the debug session.
+Do not edit state files by hand. The command validates the transition and
+records who changed what, when and why. This makes a later discrepancy
+traceable without reconstructing a chat.
 
-### 3. Exit codes are the API
+## 3. Exit codes are part of the API
 
 | Code | Meaning | Agent response |
 |---|---|---|
-| 0 | done | read output, continue |
-| 1 | usage error | fix arguments |
-| 2 | precondition unmet | report what's missing, stop |
-| 3 | not yet possible | say when to retry, don't force |
+| 0 | Command completed | Read the output and continue if authorised |
+| 1 | Arguments invalid | Correct the invocation |
+| 2 | Precondition missing | Report the missing input and stop |
+| 3 | Action not yet available | Report when it can be retried |
 
-The agent branches on the code, not on parsing prose for "error-ish
-words". Document the code table in the skill; honour it in the tool.
+Document the table next to the command. Keep prose for human context and use
+the exit code for branching.
 
-### 4. Two reports, one truth
+## 4. Human and agent reports share one data source
 
-Every report renders twice from the same data:
+Render two views from the same result object:
 
-- **HTML** for the human — rich, opened in a browser, skim-friendly
-- **Markdown twin** for the agent — the working copy it reads and reasons over
+- HTML for scanning, charts and review
+- Markdown or JSON for agent reasoning and diffs
 
-Generating the markdown from the same source as the HTML means the human
-and the agent are never looking at different numbers.
+Do not calculate a metric separately in each renderer. Record source time,
+generation time and input identifiers in both views.
 
-### 5. The learning loop is drift flags, not vibes
+## 5. Drift has named responses
 
-After every cycle, a review command compares predictions to outcomes and
-raises named drift flags ("captain picks underperforming model baseline",
-"override pass hurting accuracy"). Each flag has a *permitted response*,
-listed in advance. The agent reports the flag and its permitted response;
-it does not freelance a parameter change. Trust is built by the
-restriction, not the capability.
+After each cycle, compare the previous expectation with the outcome and emit a
+named drift flag. Each flag maps to a small set of permitted responses.
 
----
+```text
+flag: override_accuracy_below_baseline
+permitted:
+  - collect_two_more_cycles
+  - disable_override_after_human_approval
+```
 
-## The example skills
+The agent reports the evidence and the permitted response. It does not invent a
+parameter change because one result looks surprising.
 
-`fpl-status.md`, `fpl-transfer.md` and `fpl-review.md` in this directory
-are lightly edited versions of real skills from the fantasy-football
-system — status, decision and review being the three archetypes of the
-pattern. Notice
-how little they do besides: run the command, read the report, report back
-in a fixed shape, and refuse to take unrequested actions. The restraint
-is the design. A skill that says "do not run the next command unless
-asked" is a skill you can leave alone in a terminal at 11pm.
+## 6. Separate recommendation from execution
 
-## Why this matters beyond football
+A decision command may prepare a recommendation and evidence. A second,
+explicitly authorised command performs the external action. This boundary
+prevents a request to analyse from becoming permission to publish, trade,
+transfer or deploy.
 
-Anywhere you have a repeat decision with data, a model of it, and a human
-who wants the reasoning surfaced rather than a black-box answer, this shape
-applies. The agent becomes a trustworthy operator precisely because the
-workflow was built to constrain it: state can only change through
-auditable commands, exits are codes, actions beyond the permitted list are
-refused. You get the leverage of automation and the accountability of a
-checklist.
+## Worked skills
+
+- [`fpl-status.md`](fpl-status.md) shows the front-door status contract.
+- [`fpl-transfer.md`](fpl-transfer.md) shows a decision workflow with explicit
+  preconditions and no unrequested external action.
+- [`fpl-review.md`](fpl-review.md) shows outcome review and bounded drift
+  responses.
+
+The domain is deliberately concrete. Copy the contracts, not the football
+rules.
+
+## Design checklist
+
+- [ ] one status command reports state, freshness and next action
+- [ ] state files cannot be edited through the normal operator path
+- [ ] every mutation records a reason
+- [ ] exit codes have documented meanings
+- [ ] human and agent reports derive from one result object
+- [ ] recommendation and external execution use separate commands
+- [ ] drift flags have predefined responses
+- [ ] every command has a stop condition and idempotency rule

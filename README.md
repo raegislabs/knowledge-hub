@@ -1,55 +1,52 @@
-# Knowledge Hub
+# Raegis Labs Knowledge Hub
 
-Templates, guides, prompts and tooling for agentic AI workflows and coding —
-distilled from real Raegis Labs project work and published for reuse.
+A small public shelf of tools and field notes from Raegis Labs. Material stays
+here only when it adds a tested constraint or operating pattern that a stronger
+upstream project does not already provide.
 
-Browses best from the website: **[raegislabs.com/knowledge-hub](https://raegislabs.com/knowledge-hub)**
+The website's [public repository field guide](https://raegislabs.com/knowledge-hub)
+lists the upstream projects we recommend for BMAD, coding agents, skills, MCP,
+evaluation, browser automation, retrieval and prose quality.
 
-## Difficulty tiers
+## Maintained resources
 
-| Tier | For |
-|---|---|
-| **Ignition** | First contact: install the tools, run your first agent, copy a working prompt or template. |
-| **Orbit** | You ship with agents daily: wire up pipelines, hooks, multi-CLI setups, context discipline. |
-| **Deep Space** | Long-range work: orchestration loops, subagent protocols, portfolio-scale systems. |
+| Resource | What it adds | Use upstream instead when |
+|---|---|---|
+| [Fact-preserving prose gates](tools/prose-deai/) | Mechanical lint, a vendored pattern detector and a fact lock in one repeatable pass | A focused rewrite skill is enough |
+| [Local pre-push review gate](tools/review-gate/) | An operator-owned Codex review before protected-branch pushes, with no hosted CI | Your existing local release gate already performs independent review |
+| [Agent-operated workflow design](guides/deep-space/agent-operated-workflows/) | Status, state mutation, exit-code and drift-response contracts for repeat agent-run work | You need a distributed workflow runtime rather than an operator interface |
+| [Single-server deployment standards](guides/orbit/deployment-standards.md) | Host-service rules for systemd, loopback binding, secrets and recoverable backups | You run entirely on a managed platform |
+| [Coolify onboarding checklist](guides/orbit/coolify-onboarding-checklist.md) | The container and platform boundary checks most often missed during onboarding | You need current product behaviour, which belongs in Coolify's documentation |
+| [Traefik file routing](guides/orbit/traefik-file-routing.md) | A safe file-provider pattern for mixed host and container services | Docker labels already give one clear routing source |
+| [Secrets hygiene for agents](guides/orbit/secrets-hygiene.md) | Practical controls that reduce accidental disclosure through files, logs and shell commands | Your organisation has a stricter security standard |
 
-## What's here
+## Deliberate omissions
 
+This repository does not carry generic architecture, backend, frontend,
+DevOps, Git, QA, research or testing skill packs. Those packs repeated common
+guidance, aged quickly and made the useful work harder to find. It also does
+not mirror Ralph, skill creators, CLI flag references or agent-framework
+catalogues. The original projects are better sources for those jobs.
+
+## Public-safety check
+
+Run the repository gate before publishing changes:
+
+```bash
+./scripts/sanitize-check.sh
 ```
-guides/
-  ignition/     first-skill guides
-  orbit/        multi-CLI config, context optimisation, cross-CLI invocation, port assignment,
-                deployment standards, secrets hygiene, Traefik file routing, platform onboarding
-  deep-space/   agentic coding ecosystem, the Ralph loop, subagent sentinel validation,
-                agent-operated workflow design
-templates/
-  skills/       ready-to-adapt agent skill packs (qa, git-workflow, backend, frontend,
-                research, architecture, debugging, devops, project-ops, testing)
-  agents/       AGENTS.md starters for multi-CLI agent config
-tools/
-  prose-deai/   three-gate toolchain that strips AI tells from prose
-  review-gate/  pre-push hook that routes your diff through an agent review
-  db-safe/      timestamped SQLite backup and migration scripts with retention
-```
 
-## Using the skill packs
+The script resolves this repository from its own location, so it can be called
+from another working directory. It scans tracked and untracked, non-ignored
+files against [the public forbidden-pattern list](config/forbidden-patterns.txt).
+It is a supplemental check, not a substitute for reviewing the diff and Git
+history.
 
-Each pack under `templates/skills/` is a folder with a `SKILL.md` (the
-instructions an agent reads), `assets/` (fill-in templates), and `references/`
-(method notes). To use one with Claude Code, copy the pack into
-`.claude/skills/<name>/` in your project (or `~/.claude/skills/` for all
-projects). Codex, Gemini CLI and OpenCode take the same content in their own
-prompt directories — see
-[multi-cli-agent-setup](https://github.com/raegislabs/multi-cli-agent-setup)
-for the wiring.
+## Licence and attribution
 
-## Companion repositories
-
-- [multi-cli-agent-setup](https://github.com/raegislabs/multi-cli-agent-setup) — one instruction file, four agent CLIs
-- [terminal-ai-workspace](https://github.com/raegislabs/terminal-ai-workspace) — WezTerm + Zellij environment for AI-assisted coding
-- [linctl](https://github.com/raegislabs/linctl) — Linear CLI built for agents
-
-## License
-
-MIT — see [LICENSE](LICENSE). Third-party bits and their licences are listed
-in [ATTRIBUTION.md](ATTRIBUTION.md).
+Raegis Labs material is MIT licensed under [LICENSE](LICENSE).
+The prose detector vendored from
+[conorbronsdon/avoid-ai-writing](https://github.com/conorbronsdon/avoid-ai-writing)
+retains its own [MIT notice](tools/prose-deai/LICENSE-prose-patterns.js.txt).
+The prose reference also credits patterns adapted from
+[blader/humanizer](https://github.com/blader/humanizer).

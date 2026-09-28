@@ -1,134 +1,144 @@
 # Single-Server Deployment Standards
 
-Hard-won rules for running services on a small fleet of Linux servers
-(droplets, VMs, bare metal) with agentic tooling in the loop. Every rule
-below exists because something broke without it.
+Rules for host-run services on a small Linux fleet. Containers managed by
+Coolify or another platform have a different network boundary; see the
+[Coolify checklist](coolify-onboarding-checklist.md).
 
-Written provider-agnostic: substitute your own hostnames, users and
-addresses. Nothing here needs a specific vendor.
+## 1. Give every host service a systemd unit
 
----
-
-## 1. One service, one systemd unit
-
-Every long-running service runs under systemd — not tmux, not `nohup`, not a
-Docker container you can't inspect from the host.
+Use the operating system's service manager for restart policy, startup order,
+resource limits and logs.
 
 ```ini
 # /etc/systemd/system/<service>.service
-[Service]
-User=deploy
-WorkingDirectory=/var/www/<service>
-ExecStart=/usr/bin/node dist/server.js
-Restart=always
-RestartSec=5
-
-# Crash-loop protection: 3 rapid restarts stops instead of spinning
-StartLimitBurst=3
+[Unit]
+Description=<service>
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=60
+StartLimitBurst=3
 
-# Hardening
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/var/www/<service>
+EnvironmentFile=/etc/<your-org>/env/<service>.prod.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=true
 ReadWritePaths=/var/www/<service>/logs
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-Why systemd and not a process manager you installed: the OS already owns
-restart-on-boot, log rotation plumbing, and `journalctl` gives agents a
-queryable log without extra tooling. An agent debugging at 2am can run
-`systemctl status <service>` and `journalctl -u <service> -n 100` and get
-structured answers.
+`StartLimitIntervalSec` and `StartLimitBurst` belong in `[Unit]`.
+`ReadWritePaths` must list every path the process legitimately writes. Test
+hardening options against the real service before enabling the unit.
 
-## 2. Bind 127.0.0.1, terminate TLS at the edge
-
-Application services listen on loopback only. A reverse proxy (Nginx,
-Caddy, Traefik — pick one and standardise) owns the public ports, certificates,
-and routing.
-
-```
-app listens on 127.0.0.1:<port>   ← never 0.0.0.0
-        │
-reverse proxy :443 ──── TLS, HTTP/2, rate limits, routing
-        │
-public DNS → proxy only
+```bash
+sudo systemd-analyze verify /etc/systemd/system/<service>.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now <service>
+systemctl status <service>
+journalctl -u <service> -n 100 --no-pager
 ```
 
-Benefits: one place for certificates, one place for access logs, one
-firewall story (80/443 open, everything else closed), and no accidental
-"the dev server is now internet-facing" incidents. Keep the proxy's dynamic
-config in a file an agent can read and diff — config-as-code beats
-click-ops when the change is made by something without a mouse.
+## 2. Keep host application ports on loopback
 
-## 3. Environment files, centralised and locked down
+A host-run application listens on `127.0.0.1:<port>`. The edge proxy owns
+public ports, TLS and routing.
 
-All secrets live in env files under one root, not scattered through service
-directories:
-
-```
-/etc/<your-org>/env/<service>.<env>.env    # chmod 640, root:deploy
+```text
+public DNS -> edge proxy :443 -> 127.0.0.1:<service-port>
 ```
 
-Rules:
+This rule applies to host processes. A process inside a container normally
+listens on `0.0.0.0` inside that container so the container network can reach
+it. Do not publish that container port publicly. If a host mapping is required,
+bind the mapping to loopback:
 
-- `chmod 640`, owned `root:deploy` — the service user can read, nobody else
-- One file per service per environment; the systemd unit loads it via
-  `EnvironmentFile=`
-- The directory is the deployment contract: `ls /etc/<your-org>/env/` is the
-  inventory of everything running
-- Back up this directory encrypted; it *is* the keys to the kingdom
-- For higher-stakes setups, move the SSot into a secrets manager (see
-  [secrets-hygiene.md](secrets-hygiene.md)) and keep env files generated,
-  never hand-edited
+```yaml
+ports:
+  - "127.0.0.1:8100:3000"
+```
 
-## 4. A deploy user that isn't root
+## 3. Keep service environment files in one protected root
 
-Agents and CI deploy as a dedicated user with exactly the rights needed:
-write to service directories, restart its own units (via a sudo allowlist),
-read its own env files. Root stays for humans on the console.
+```text
+/etc/<your-org>/env/<service>.<environment>.env
+```
+
+- Own each file as `root:deploy` with mode `0640`.
+- Give each service its own file and credentials.
+- Load the file with `EnvironmentFile=`.
+- Keep the writable source in a secrets manager where possible. Generate the
+  host file and do not edit it by hand.
+- Encrypt backups of this directory and restrict restore access.
+
+## 4. Deploy through a restricted account
+
+Run services and deployment commands as a dedicated user. Give it only the
+specific privileged commands it needs.
 
 ```sudoers
-deploy ALL=(root) NOPASSWD: /bin/systemctl restart <service>, /bin/systemctl status <service>*
+deploy ALL=(root) NOPASSWD: /bin/systemctl restart <service>
+deploy ALL=(root) NOPASSWD: /bin/systemctl status <service>
 ```
 
-The failure mode this prevents: a hallucinated command in an agentic deploy
-runs as root because the deploy pipeline happened to be logged in as root.
+Use exact command paths from `command -v systemctl` on the target host.
+Avoid wildcard-heavy sudo rules. Root remains an operator account, not the
+default automation identity.
 
-## 5. Backups with retention, tested
+## 5. Back up databases through a consistent interface
 
-- Database dumps on a schedule (cron or systemd timers — operator-owned,
-  not a CI provider)
-- Timestamped files with retention (`--keep-days 7` beats "we'll clean it up
-  later")
-- For SQLite: checkpoint WAL before copying (`PRAGMA wal_checkpoint(TRUNCATE);`)
-  or your backup is a torn read
-- Monthly: actually restore one. An untested backup is a rumour.
+For server databases, use the database's supported dump or backup command.
+For SQLite, prefer the
+[online backup API](https://www.sqlite.org/backup.html) or the CLI `.backup`
+command while the database is live.
 
-The backup scripts in `tools/db-safe/` of this repo implement the pattern.
+```bash
+sqlite3 /var/lib/<service>/app.db ".backup '/var/backups/<service>/app-$(date +%F).db'"
+```
 
-## 6. Monitoring that pages a human
+If an operating procedure uses a WAL checkpoint, abort the backup when the
+checkpoint fails. Do not continue with a raw copy. A raw copy is safe only when
+the database is stopped or when the database, WAL and shared-memory files are
+captured as one consistent snapshot.
 
-An uptime monitor with alerts (Uptime Kuma self-hosted, or a hosted
-equivalent) watching the public endpoints *and* one internal heartbeat per
-service. Agents can check status; only humans should be paged.
+- Schedule backups with a systemd timer or cron on an operator-owned host.
+- Use timestamped files and explicit retention.
+- Encrypt off-host copies.
+- Restore a sample on a schedule and record the result.
 
-## 7. Automation stays operator-owned
+## 6. Monitor from the user's side
 
-Deployment hooks, backup schedules and sync jobs run from machines you
-control via launchd, systemd timers or cron — not from a hosted CI provider.
-Cost is one reason; the better reason is that "the pipeline that can deploy
-to production" should not have credentials living in a third-party SaaS you
-half-remember configuring. If a hosted CI is genuinely required, scope its
-credentials to exactly one target and rotate them on a schedule.
+Check the public HTTPS endpoint and a service-specific health endpoint.
+Alert a human when availability or data freshness breaches a stated limit.
+Keep alert delivery independent from the service being monitored.
 
----
+## 7. Keep release automation operator-owned
 
-## The checklist (pin this)
+Run deployment hooks, backup schedules and release gates on machines you
+control through launchd, systemd timers or cron. Do not place production
+credentials in GitHub Actions or another hosted CI runner.
 
-- [ ] Service runs under systemd with crash-loop protection
-- [ ] Listens on 127.0.0.1 only; TLS terminates at the reverse proxy
-- [ ] Env file in the central directory, `chmod 640`, loaded by the unit
-- [ ] Deploys happen as a non-root user with a sudo allowlist
-- [ ] Backups run on a timer, with retention, and one was restored this quarter
-- [ ] Uptime monitoring covers public endpoints and internal heartbeats
-- [ ] No deploy credentials live in a hosted CI provider
+## Release checklist
+
+- [ ] systemd unit verifies and stops cleanly
+- [ ] crash-loop limits are in `[Unit]`
+- [ ] host service listens on loopback only
+- [ ] edge proxy terminates TLS
+- [ ] environment file is service-specific and mode `0640`
+- [ ] deployment account has an exact sudo allowlist
+- [ ] backup uses a consistent database interface
+- [ ] a recent restore has succeeded
+- [ ] public health and freshness checks alert a human
+- [ ] release gate and scheduler are operator-owned

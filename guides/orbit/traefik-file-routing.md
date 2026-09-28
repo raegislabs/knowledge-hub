@@ -1,98 +1,113 @@
 # Traefik File-Based Routing
 
-How to run Traefik as a single edge proxy for a mixed fleet of systemd
-services and Docker containers, with all routing in one version-controlled
-file.
+Use Traefik's file provider when one reviewed dynamic configuration should
+describe routes for both host-run services and containers. If every service is
+already represented by trustworthy Docker labels, keep the label provider and
+avoid a second routing source.
 
----
+## Choose the network shape first
 
-## Why file-based config, not Docker labels
+The examples below assume one of these shapes:
 
-The default Traefik setup discovers routes from Docker labels. On a server
-that runs a mix of systemd services and containers, labels don't cover half
-the fleet, and routing knowledge ends up scattered across compose files.
-File-based config instead:
+1. Traefik runs as a host process and can reach host services on loopback.
+2. Traefik runs in a Linux container with host networking and can therefore
+   reach host loopback.
 
-- Works identically for systemd services, containers, and anything else
-  that can listen on a port
-- Is one YAML file you can diff, review and back up in git
-- Supports weighted services (blue/green) without orchestrator tricks
-- Keeps routing alive even when the platform that manages containers
-  (Coolify, Portainer) is itself broken — the edge doesn't depend on it
+A normal bridged container cannot reach a host service through
+`127.0.0.1`. In that container, loopback refers to Traefik itself.
 
-The trade-off: you maintain the file. The sections below are the whole
-maintenance surface.
-
-## Layout
-
-| Component | Where |
-|-----------|-------|
-| Traefik | container or binary, exposing :80 and :443 |
-| Dynamic config | `<config-root>/traefik-dynamic.yml` (watched, hot-reloads) |
-| ACME certs | `<config-root>/acme/acme.json` (`chmod 600`) |
-
-Static config via arguments:
-
-```bash
---entrypoints.web.address=:80
---entrypoints.websecure.address=:443
---entrypoints.web.http.redirections.entryPoint.to=websecure
---entrypoints.web.http.redirections.entryPoint.scheme=https
---certificatesresolvers.le.acme.email=you@example.com
---certificatesresolvers.le.acme.storage=/etc/traefik/acme/acme.json
---certificatesresolvers.le.acme.httpchallenge=true
---certificatesresolvers.le.acme.httpchallenge.entrypoint=web
---entrypoints.websecure.http.tls.certResolver=le
---providers.file.directory=/etc/traefik/dynamic
---providers.file.watch=true
-```
-
-Do **not** enable the Docker provider. If it's on, label discovery silently
-competes with your file.
-
-## Adding a route
-
-### Systemd service (or any loopback listener)
+Container applications should listen on `0.0.0.0` inside their container. If
+Traefik uses host networking, publish an application port to host loopback:
 
 ```yaml
+services:
+  app:
+    ports:
+      - "127.0.0.1:8100:3000"
+```
+
+Do not combine host networking with Docker `ports` on the Traefik service;
+host networking already exposes its listeners.
+
+## Static configuration
+
+Static configuration defines entry points, the file provider and ACME storage.
+Keep ACME state outside Git and set its file mode to `0600`.
+
+```yaml
+# /etc/traefik/traefik.yml
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  le:
+    acme:
+      email: operator@example.com
+      storage: /var/lib/traefik/acme.json
+      httpChallenge:
+        entryPoint: web
+```
+
+The HTTP challenge requires public port 80 to reach Traefik. Define the
+resolver in static configuration and reference it from each TLS router.
+
+Mount the parent dynamic directory into a container, not one individual file.
+Some editors replace a file by moving a new inode into place, which can break a
+single-file bind mount or its watch event.
+
+## Dynamic route
+
+```yaml
+# /etc/traefik/dynamic/services.yml
 http:
   routers:
-    my-service:
-      rule: "Host(`my-service.example.com`)"
+    example:
+      rule: "Host(`example.example.com`)"
       entryPoints:
         - websecure
-      service: my-service
-      tls:
-        certResolver: le
+      service: example
       middlewares:
         - secure-headers
+      tls:
+        certResolver: le
+
+  middlewares:
+    secure-headers:
+      headers:
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: strict-origin-when-cross-origin
 
   services:
-    my-service:
+    example:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:8100"
+        healthCheck:
+          path: /health
+          interval: 10s
+          timeout: 3s
 ```
 
-Certificates are issued automatically on first request; no per-domain
-setup beyond the DNS record.
+Replace the host rule, port and health path. DNS must point at the edge before
+certificate issuance can succeed.
 
-### Docker container
+## Reusable controls
 
-Map the container port to the host, then point the route at the host port
-— same as above:
-
-```yaml
-# docker-compose.yaml
-services:
-  my-app:
-    ports:
-      - '8100:3000'   # host:container
-```
-
-### Rate limiting
-
-Define once, attach to any router:
+Rate limit a public API:
 
 ```yaml
 http:
@@ -101,91 +116,75 @@ http:
       rateLimit:
         average: 50
         burst: 100
-    login-rate-limit:
-      rateLimit:
-        average: 1
-        burst: 5
 ```
 
-### Restricting to a private network
-
-If you run a mesh VPN (Tailscale and friends), internal dashboards can be
-limited to its address range:
+Restrict a router to a mesh VPN range:
 
 ```yaml
 http:
-  routers:
-    internal-service:
-      rule: "Host(`internal.example.com`)"
-      middlewares:
-        - vpn-only
-
   middlewares:
     vpn-only:
       ipAllowList:
         sourceRange:
-          - "100.64.0.0/10"   # CGNAT range used by the mesh
+          - "100.64.0.0/10"
 ```
 
-## Blue/green without an orchestrator
+Attach the middleware by name to the intended router. Confirm the client IP
+Traefik sees before relying on an allowlist behind another proxy.
 
-Run both versions on different loopback ports and switch traffic by
-weight. Traefik hot-reloads the file, so "deploy" is a YAML edit:
+## Weighted cutover
+
+Weighted services can move traffic between two healthy backends:
 
 ```yaml
 http:
+  routers:
+    app:
+      rule: "Host(`app.example.com`)"
+      entryPoints: [websecure]
+      service: app-active
+      tls:
+        certResolver: le
+
   services:
-    myapp-blue:
+    app-blue:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:8010"
-
-    myapp-green:
+    app-green:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:8100"
-
-    myapp-active:
+    app-active:
       weighted:
         services:
-          - name: myapp-blue
+          - name: app-blue
             weight: 100
-          - name: myapp-green
+          - name: app-green
             weight: 0
 ```
 
-Start the new version, move weight to it, watch health, keep or revert.
-No downtime window, no container gymnastics.
+Move a small share first, check health and errors, then complete or revert the
+cutover. Keep old and new application versions compatible with the same
+database state during the test.
 
-## Keep a port registry
+## Apply and verify
 
-File-based routing means you assign host ports yourself. Keep a table in
-the repo (`service | port | type`) so assignments never collide — or use
-deterministic per-project ranges (see
-[port-assignment-setup.md](port-assignment-setup.md) for the local
-equivalent of the same idea).
-
-## Applying and verifying changes
-
-The file is watched; save it and Traefik reloads within seconds. No
-restarts.
+1. Review the dynamic diff.
+2. Save the file inside the watched directory.
+3. Check Traefik logs for a parse or provider error.
+4. Confirm the backend is listening on the expected host port.
+5. Test the public route and health endpoint.
 
 ```bash
-# Edge logs, if Traefik runs as a container
-docker logs <traefik-container> --tail 20
-
-# Route works end to end
-curl -I https://my-service.example.com/health
+ss -ltn | grep ':8100'
+curl --fail --show-error --silent https://example.example.com/health
 ```
 
-If a route 404s: check the rule string backticks (YAML + Traefik quoting
-bites everyone once), then check the service URL points at a host port
-that is actually listening (`lsof -i :8100`).
+File watching does not make every edit valid. A bad dynamic file may leave the
+previous configuration active, so logs and an end-to-end request are required.
 
-## Notes
-
-1. Docker labels do nothing here — the Docker provider is off; don't add
-   them "just in case"
-2. Containers must publish host ports for file routing to reach them
-3. `acme.json` must stay `chmod 600` or Traefik refuses to start
-4. The dynamic file belongs in version control — it *is* your edge
+See Traefik's current
+[file-provider](https://doc.traefik.io/traefik/providers/file/) and
+[ACME](https://doc.traefik.io/traefik/https/acme/) documentation for the
+version you operate.

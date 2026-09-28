@@ -1,102 +1,115 @@
 # Secrets Hygiene for Agent Workflows
 
-AI coding agents are the newest member of the team that will cheerfully
-cat any file, echo any variable into a log, and paste a token into a commit
-message while trying to be helpful. Standard secrets discipline assumed a
-human's sense of shame. Agents don't have one. This is the rulebook that
-works anyway.
+Coding agents inspect files, run commands and quote diagnostic output. That
+makes accidental disclosure through transcripts, logs, shell history and Git a
+normal threat to design for.
 
----
+## 1. Give the agent a job interface, not a secret value
 
-## The problem, concretely
+Prefer a narrow wrapper that fetches a scoped credential and immediately
+executes the approved job:
 
-An agent with filesystem access and a debugging task will, left to itself:
-
-1. Read `.env` to "check the configuration" and quote it into the transcript
-2. Run `env` or print config objects to see what's loaded
-3. Write example files containing the *real* values it saw
-4. Fix a failing integration test by hardcoding the credential it found
-   in a sibling project
-
-None of this is malicious. All of it ends with a secret in a log file,
-a shell history, or a public repo.
-
-## Principle 1: agents don't read secrets, they use them
-
-Secrets should be injected at execution time by a wrapper the agent invokes,
-never read from a file the agent can open:
-
-```
-agent runs:  agent-run deploy-job
-             └── wrapper pulls creds from the secrets manager
-             └── child process gets env vars; agent's shell never sees them
+```text
+agent -> agent-run <job> -> secret manager -> child process
 ```
 
-The agent learns "there is a command that does the thing", not "the key
-lives at this path". Knowledge of *how* and *that* separated is the whole
-game.
+The wrapper should:
 
-## Principle 2: one secret, one purpose, one scope
+- accept an allowlisted job name rather than an arbitrary shell command
+- request only the credential needed for that job
+- avoid printing values or the child environment
+- remove temporary material on every exit path
+- return a documented exit code without copying sensitive output
 
-Every credential answers to a single job:
+This reduces exposure. It does not create a security boundary if the agent has
+the same operating-system permissions as the secret manager client.
 
-- Per-service tokens, not a shared "server token"
-- Scoped permissions (read-only database creds for analytics jobs;
-  write only where the job writes)
-- Short TTLs where the provider supports them
-- A name that encodes the owner and purpose:
-  `<service>-<environment>-<purpose>`
+## 2. Scope every credential
 
-When a token leaks — and plan for the day one does — scoping is what turns
-an incident into a rotation.
+- Use one credential per service, environment and purpose.
+- Grant read or write access only where the job requires it.
+- Prefer short lifetimes where the provider supports them.
+- Record the owner, consumer and rotation procedure.
+- Do not share a broad server token across unrelated jobs.
 
-## Principle 3: the manager is the only writable source
+A useful name states the service, environment and purpose:
+`<service>-<environment>-<purpose>`.
 
-Pick one secrets manager (Infisical, Bitwarden Secrets Manager, Doppler,
-Vault — they're all fine) and treat it as the single source of truth:
+## 3. Keep one writable source
 
-- Nothing hand-edits generated env files; they're artifacts, regenerated
-- Local `.env` files, when unavoidable, hold only non-secret config
-- The bootstrap credential for the manager itself lives in the OS keychain
-  or is typed by a human — never in the repo, never in a dotfile an agent
-  can read
+Use a secrets manager as the writable source. Generated environment files are
+deployment artifacts, not a second place to edit.
 
-## Principle 4: keep the leak-proofing mechanical
+- Keep bootstrap credentials in an OS keychain or hardware-backed store.
+- Restrict generated host files to the service account.
+- Do not place real values in `.env.example`.
+- Keep production secrets out of repository settings and hosted CI runners.
+- Rotate a secret in the manager, regenerate the consumer and verify the old
+  value no longer works.
 
-Because agents generate traffic at machine speed, the guards must be
-mechanical too:
+## 4. Keep secrets out of commands and logs
 
-- **Grep gate on publish.** A pre-push hook that fails on token-shaped
-  strings (`sk-…`, `ghp_…`, `AKIA…`, Bearer headers, `password =` lines)
-  before anything leaves the machine. This repo ships one: see
-  `scripts/sanitize-check.sh` in the repo root.
-- **History hygiene on publish.** Publishing a repo? Fresh `git init`, copy
-  the tree in. Old history is where since-deleted secrets go to be found.
-- **Log redaction at the source.** Structured logging with a denylist of
-  field names (`token`, `authorization`, `api_key`) beats hoping no agent
-  ever prints them.
-- **Shell history is a secret store.** It shouldn't be. `HISTCONTROL` with
-  `ignorespace`, and a habit of ` read -s` in scripts that take credentials.
+Command-line arguments may appear in process listings and shell history.
+Prefer standard input, a protected file descriptor or a provider SDK.
 
-## Principle 5: rotation is routine, not an event
+When a human must enter a value in a shell:
 
-If rotating a credential is a big deal, you have a coupling problem. A
-quarterly rotation that takes ten minutes per service means each secret has
-exactly one consumer and the manager distributes the new value without
-humans editing files. If rotation is scary, find the hard-coded consumer
-first — that consumer is your real security posture.
+```bash
+IFS= read -r -s SECRET_VALUE
+printf '\n'
+```
 
----
+Do not rely on a shell's history-ignore setting as the primary control.
 
-## A minimal working setup
+For application logs:
 
-1. Secrets manager with one project per environment, entries named
-   `<service>-<purpose>`
-2. A wrapper command (`agent-run <job>` or your equivalent) that fetches
-   and execs — the only door agents get
-3. Pre-push grep gate in every repo, extended with your own patterns
-  (client names, internal hostnames)
-4. Quarterly calendar reminder: rotate one project's secrets, time it
+- allowlist fields that may be recorded
+- redact headers such as `Authorization` and `Cookie` at the logger boundary
+- reject fields named `token`, `secret`, `password` or `api_key`
+- review error objects from SDKs, which may contain request headers
+- set retention and access rules for agent transcripts and tool logs
 
-That's the whole stack. The discipline is in the wrapper being the only
-door, not in the choice of manager.
+## 5. Add a mechanical publish check
+
+This repository includes [`sanitize-check.sh`](../../scripts/sanitize-check.sh)
+for client markers, infrastructure identifiers and common token shapes.
+
+```bash
+./scripts/sanitize-check.sh
+git diff --cached
+```
+
+Pattern scans have false negatives. Also inspect:
+
+- the staged diff
+- untracked files
+- the full Git history when a real secret was ever committed
+- generated examples and fixtures
+- screenshots, recordings and exported transcripts
+
+If a credential entered Git history, revoke it before cleaning the history.
+Rewriting the repository does not make the credential safe again.
+
+## 6. Make rotation ordinary
+
+Test one rotation on a schedule:
+
+1. issue a replacement with the same narrow scope
+2. update the manager and regenerate the consumer
+3. verify the service with the new credential
+4. revoke the old credential
+5. confirm alerts, backups and secondary jobs still work
+6. record duration and any hidden consumer
+
+Slow or risky rotation usually indicates an undocumented consumer or excessive
+credential scope.
+
+## Minimum review
+
+- [ ] agent invokes an allowlisted wrapper
+- [ ] wrapper fetches one job-scoped credential
+- [ ] secret values never appear in arguments or normal logs
+- [ ] generated environment files have restrictive ownership and mode
+- [ ] repository and transcript retention are defined
+- [ ] publish scan and staged-diff review both run locally
+- [ ] rotation and revocation have been tested

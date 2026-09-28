@@ -1,102 +1,110 @@
-# Self-Host Platform Onboarding Checklist (Coolify)
+# Coolify Service Onboarding Checklist
 
-Bring a new service onto a self-hosted Coolify installation without
-forgetting the boring steps. Written for Coolify; the shape transfers to
-any PaaS-on-your-own-server (Dokku, CapRover, Portainer + Compose).
+A release checklist for a containerised service on a self-hosted Coolify
+instance. Use Coolify's current documentation as the authority for product
+settings and supported build modes.
 
----
+## 1. Build a production container
 
-## 1. Repository and build
+- [ ] The Dockerfile builds from a clean checkout.
+- [ ] The runtime image contains only production dependencies.
+- [ ] The process handles SIGTERM and exits within the deployment grace period.
+- [ ] The process runs as a non-root user unless a documented requirement
+      prevents it.
+- [ ] Persistent data uses a named volume or external service.
+- [ ] A health check tests a real dependency boundary, not only that the process
+      exists.
 
-- [ ] Repository exists for the service.
-- [ ] `Dockerfile` builds a production image locally (no missing dependencies).
-- [ ] `docker-compose.yml` (if used) defines:
-  - [ ] Single app service with the correct internal port.
-  - [ ] Health check configured (`/health` or equivalent).
-  - [ ] Resource limits set (CPU and memory).
-  - [ ] Named volumes for persistent data (if needed).
-- [ ] `.env.example` added with all required variables (no real secrets).
-- [ ] `README.md` covers purpose, env vars, and health endpoints.
+Example health check:
 
-## 2. Platform project
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
+```
 
-- [ ] Project created or selected (kebab-case, product-aligned).
-- [ ] Application resource created via the Git integration.
-- [ ] Correct repository and branch selected (`main` → production,
-      `develop` → staging if applicable).
-- [ ] Build method (Dockerfile / buildpack) and base directory validated.
+Use a tool that exists in the runtime image. A missing `curl` or `wget` makes a
+healthy application look unhealthy.
 
-## 3. Deployment strategy and health
+## 2. Bind correctly inside the container
 
-- [ ] Zero-downtime strategy selected: rolling (stateless) or
-      blue/green (critical services).
-- [ ] Health check configured in the platform:
-  - [ ] Path matches the application (`/health` or `/api/health`).
-  - [ ] Interval ~10 seconds.
-  - [ ] Healthy threshold ≥ 2 consecutive successes.
-  - [ ] Graceful shutdown timeout ≥ 30 seconds.
-- [ ] The application actually implements the endpoint.
+- [ ] The application listens on `0.0.0.0:<internal-port>` inside the
+      container.
+- [ ] The Coolify port setting matches that internal port.
+- [ ] The service does not publish a public host port.
+- [ ] If an operator explicitly needs a host mapping, it is bound to loopback:
+      `127.0.0.1:<host-port>:<container-port>`.
 
-## 4. Environment and secrets
+`127.0.0.1` inside a container is the container itself. Setting
+`HOST=127.0.0.1` prevents Coolify's proxy network from reaching the
+application.
 
-- [ ] Every variable from `.env.example` created in the platform.
-- [ ] Sensitive variables marked as secrets.
-- [ ] No real `.env` files committed to Git.
-- [ ] Standard variables set: `HOST=127.0.0.1`, `PORT=<port>`,
-      `ENVIRONMENT=production`, `LOG_LEVEL=INFO`.
-- [ ] `DATABASE_URL` set if the service uses a database.
-- [ ] Notification webhook URL set if deployment alerts are wanted.
+## 3. Declare configuration and secrets
 
-## 5. Networking and TLS
+- [ ] `.env.example` contains variable names and safe placeholders only.
+- [ ] Every required variable is present in Coolify.
+- [ ] Secret values are marked as secrets and are scoped to this service.
+- [ ] Compose deployments fail when a required variable is absent.
 
-Public services:
+```yaml
+services:
+  app:
+    environment:
+      DATABASE_URL: "\${DATABASE_URL:?DATABASE_URL is required}"
+      APP_ENV: "\${APP_ENV:-production}"
+```
 
-- [ ] DNS record points at the server's reserved IP.
-- [ ] Domain added in the platform; certificate issued (Let's Encrypt).
+- [ ] No real `.env` file is committed.
+- [ ] Logs do not print environment objects, tokens or connection strings.
+
+## 4. Configure the resource in Coolify
+
+- [ ] Correct repository, branch and base directory selected.
+- [ ] Build method matches the repository.
+- [ ] Internal port and health state are visible in the resource.
+- [ ] CPU and memory limits are set from measured needs.
+- [ ] Restart behaviour is documented.
+- [ ] A manual deployment succeeds before any automatic trigger is enabled.
+
+If a Git-host webhook triggers deployment, the receiver should be your own
+Coolify instance. Do not add a GitHub Actions deployment workflow or store
+production credentials in a hosted runner.
+
+## 5. Configure domain and TLS
+
+For a public service:
+
+- [ ] DNS points to the intended server.
+- [ ] Domain is attached to the correct Coolify resource.
+- [ ] TLS certificate is valid.
 - [ ] HTTP redirects to HTTPS.
-- [ ] Health endpoint reachable at `https://<domain>/health`.
+- [ ] Health endpoint returns the expected status through the public domain.
+- [ ] Proxy and application logs agree on the request.
 
-Internal-only services:
+For an internal service:
 
-- [ ] No domain configured.
-- [ ] Reachable from other containers via the shared Docker network.
+- [ ] No public domain or public host port is configured.
+- [ ] Consumers use the service name on the intended Docker network.
+- [ ] Network membership is limited to services that need access.
 
-## 6. Database (if applicable)
+## 6. Handle database changes
 
-- [ ] Database created, internal-only (no public port).
-- [ ] Connection string copied into service environment.
-- [ ] Migrations run successfully on first deploy.
+- [ ] Backup or restore point exists before a destructive migration.
+- [ ] Migration command is idempotent or guarded against a second run.
+- [ ] Only one release instance performs the migration.
+- [ ] Application code remains compatible during a rolling replacement.
+- [ ] Rollback behaviour is written down and tested on staging.
 
-## 7. Webhooks and auto-deploy
+## 7. Prove the release path
 
-- [ ] Auto-deploy on push enabled for the chosen branches.
-- [ ] Webhook deliveries show success in the Git host.
-- [ ] One manual deployment has succeeded.
+- [ ] New container becomes healthy before traffic moves.
+- [ ] Existing requests finish during shutdown.
+- [ ] A small release produces no unexpected 5xx responses.
+- [ ] Application, proxy and database logs contain no new errors.
+- [ ] Rollback returns the previous version to healthy state.
+- [ ] Operator inventory records the service, owner, domain, internal port,
+      data stores, backup job and alert route.
 
-## 8. Notifications
-
-- [ ] Webhook (Slack/other) created and stored as a secret.
-- [ ] Deployment started / succeeded / failed events configured.
-- [ ] A test deployment actually sends the messages.
-
-## 9. First deploy validation
-
-- [ ] Build logs clean; container starts.
-- [ ] Status `Running`, health indicator green.
-- [ ] Health endpoint returns `200 OK`.
-- [ ] Startup logs look sane in the log viewer.
-
-## 10. Zero-downtime check
-
-- [ ] Trivial change pushed to the auto-deploy branch.
-- [ ] New version passes health before old container stops.
-- [ ] No 5xx responses during the deployment window.
-
-## 11. Documentation and inventory
-
-- [ ] README updated: architecture, dependencies, env vars, endpoints.
-- [ ] Central service inventory updated (one table somewhere: service,
-      port, type — see the port registry note in
-      [traefik-file-routing.md](traefik-file-routing.md)).
-
-All boxes checked = onboarded.
+Recheck the
+[Coolify Docker Compose](https://coolify.io/docs/knowledge-base/docker/compose)
+and [health-check](https://coolify.io/docs/knowledge-base/health-checks)
+documentation when the platform version changes.

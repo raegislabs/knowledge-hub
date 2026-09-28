@@ -1,7 +1,7 @@
 /**
  * Avoid AI Writing — detection engine (canonical source of truth)
- * Implements regex, structural, and stylometric pattern detection. This repo's SKILL.md
- * catalogs the human-editable pattern rules; this engine is the executable
+ * Implements regex, structural, and stylometric pattern detection. The upstream
+ * Avoid AI Writing skill catalogs the human-editable rules; this engine is the executable
  * expression of the regex-detectable subset and extends it with stylometric and
  * AI-tool-fingerprint detectors that don't make sense as skill prose
  * (cross-paragraph burstiness, smart-punct signatures, function-word
@@ -154,9 +154,9 @@ const AIDetector = (() => {
     // metaphor (structure, element, frame, foundation) are omitted so "the
     // load-bearing structure of the argument" still fires. Some listed nouns
     // (member, column, partition) can still be used metaphorically and are
-    // silently exempt — a recall loss in the safe direction, tracked in #56.
+    // silently exempt, which is a known recall trade-off in the safe direction.
     // Predicative use ("the wall is load-bearing") is NOT exempt: the tell
-    // lives in the subject, which a lookahead cannot reach. Also #56.
+    // lives in the subject, which a lookahead cannot reach.
     { pattern: /\bload-bearing\b(?!\s+(?:(?:structural|exterior|interior|internal|external|concrete|steel|timber|wooden|brick|masonry|perimeter|basement|main|primary|existing|original)\s+)?(?:walls?|beams?|columns?|joists?|truss(?:es)?|members?|footings?|slabs?|studs?|partitions?|masonry|lintels?|piers?|rafters?|girders?|capacity|capacities)\b)/gi, replace: 'essential, critical, or say what breaks if you remove it' },
   ];
 
@@ -521,8 +521,7 @@ const AIDetector = (() => {
 
   // ─── AI-tool fingerprints ──────────────────────────────────────────
   // Three near-definitive AI-origin signals adapted from
-  // Aboudjem/humanizer-skill P33-P35 (see docs/competitive/audits/
-  // 2026-05-17-aboudjem-humanizer-skill.md). Unlike the statistical
+  // Aboudjem/humanizer-skill P33-P35. Unlike the statistical
   // patterns above, single hit on any of these is strong evidence —
   // the AI tool literally left its fingerprint in the text.
 
@@ -1741,9 +1740,8 @@ const AIDetector = (() => {
     // tends flatter (0.55–0.75 looks normal, but the lower end of the
     // *too-flat* tail at >=200 words is where the signal lives — too
     // FEW unique words for the length). This is the simplest of the
-    // four stylometric signals identified in the May 2026 detection-
-    // research review (docs/competitive/detection-research.md): no
-    // POS tagger required, no model, pure JS.
+    // four stylometric signals identified in a May 2026 research review.
+    // No POS tagger required, no model, pure JS.
     //
     // Threshold tuning: flag only when the sample is large enough
     // that low TTR is meaningfully suspicious (>=200 tokens) AND TTR
