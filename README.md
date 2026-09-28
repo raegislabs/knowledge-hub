@@ -14,6 +14,7 @@ evaluation, browser automation, retrieval and prose quality.
 |---|---|---|
 | [Fact-preserving prose gates](tools/prose-deai/) | Mechanical lint, a vendored pattern detector and a fact lock in one repeatable pass | A focused rewrite skill is enough |
 | [Local pre-push review gate](tools/review-gate/) | An operator-owned Codex review before protected-branch pushes, with no hosted CI | Your existing local release gate already performs independent review |
+| [One instruction source for several CLIs](tools/instruction-links/) | A reversible installer that points Claude Code, Codex and OpenCode at one `AGENTS.md`, wired to the paths each CLI actually reads | You use one CLI; edit its own instruction file instead |
 | [Agent-operated workflow design](guides/deep-space/agent-operated-workflows/) | Status, state mutation, exit-code and drift-response contracts for repeat agent-run work | You need a distributed workflow runtime rather than an operator interface |
 | [Single-server deployment standards](guides/orbit/deployment-standards.md) | Host-service rules for systemd, loopback binding, secrets and recoverable backups | You run entirely on a managed platform |
 | [Coolify onboarding checklist](guides/orbit/coolify-onboarding-checklist.md) | The container and platform boundary checks most often missed during onboarding | You need current product behaviour, which belongs in Coolify's documentation |

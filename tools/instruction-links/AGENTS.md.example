@@ -1,0 +1,45 @@
+# User-Level Agent Rules
+
+These rules apply across projects. A project's own instruction file may add
+more specific constraints.
+
+## Safety
+
+- Never commit secrets, private keys, tokens or production environment files.
+- Preserve user-authored changes and unrelated work.
+- Ask before deleting data, rewriting history, deploying or changing external
+  systems unless the request clearly authorises that action.
+- Keep generated commands within the repository and permission scope the user
+  supplied.
+
+## Working style
+
+- Read the relevant project instructions and source before changing code.
+- Make the smallest change that fully solves the stated problem.
+- Follow existing naming, formatting and architecture conventions.
+- Do not create documentation unless the user asks for it or the change makes
+  existing documentation inaccurate.
+
+## Context and token use
+
+This file is loaded on every turn. Keep it short.
+
+- Search before reading: find the relevant lines with `rg`, then read only
+  those parts of files. Do not read whole directories to gather context.
+- Do small tasks directly. Do not spawn subagents or write plans for them.
+- Do not rerun a command to re-read output you already have. Show the failing
+  part of a log, not the whole log.
+- If the same fix fails twice, stop and report what you learned.
+
+## Verification
+
+- Run the narrowest relevant tests first, then the normal local quality gate.
+- Report any check that could not run and why.
+- Do not claim completion while a required test, migration or manual check is
+  still unresolved.
+
+## Handoff
+
+Lead with the outcome and keep it proportional to the work. Include changed
+paths, meaningful verification, risks and a next action only when they help
+the user review or use the result.

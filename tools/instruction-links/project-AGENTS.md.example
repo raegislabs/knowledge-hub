@@ -1,0 +1,49 @@
+# Project Agent Instructions
+
+## Project
+
+- Purpose: <one sentence>
+- Primary users: <who uses it>
+- Stack: <languages, frameworks, storage>
+- Package manager: <tool>
+
+## Commands
+
+| Job | Command |
+|---|---|
+| Install | `<install command>` |
+| Develop | `<development command>` |
+| Test | `<test command>` |
+| Lint | `<lint command>` |
+| Build | `<build command>` |
+| Local release gate | `<pre-push or release command>` |
+
+## Architecture boundaries
+
+- Entry points: <paths>
+- Domain logic: <paths>
+- Data access: <paths>
+- Tests: <paths>
+- Generated or vendored code: <paths and edit policy>
+
+## Project rules
+
+- <rule that is specific enough to change an implementation decision>
+- <compatibility or performance constraint>
+- <error-handling and logging convention>
+- <test requirement for changed behaviour>
+
+## Safety and operations
+
+- Never commit real secret values. Document variable names in `.env.example`.
+- Do not run destructive migrations or production commands without explicit
+  authority and a verified target.
+- Do not create new documentation unless requested or needed to correct
+  documentation made inaccurate by the change.
+
+## Definition of done
+
+- requested behaviour is implemented
+- relevant local tests and lint pass
+- user changes and unrelated files remain intact
+- errors, compatibility changes and incomplete verification are reported
